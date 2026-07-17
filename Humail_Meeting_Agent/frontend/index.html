@@ -1,0 +1,586 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Humail Umar - Autonomous AI Interview Agent</title>
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- FontAwesome Icons -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <style>
+    @keyframes pulse-subtle {
+      0%, 100% { transform: scale(1); opacity: 0.9; }
+      50% { transform: scale(1.02); opacity: 1; }
+    }
+    @keyframes pulse-glow-thinking {
+      0%, 100% { box-shadow: 0 0 15px rgba(168, 85, 247, 0.4); border-color: #a855f7; }
+      50% { box-shadow: 0 0 30px rgba(168, 85, 247, 0.85); border-color: #d8b4fe; }
+    }
+    @keyframes pulse-glow-speaking {
+      0%, 100% { box-shadow: 0 0 15px rgba(34, 197, 94, 0.4); border-color: #22c55e; }
+      50% { box-shadow: 0 0 35px rgba(34, 197, 94, 0.9); border-color: #86efac; }
+    }
+    @keyframes pulse-glow-listening {
+      0%, 100% { box-shadow: 0 0 15px rgba(96, 165, 250, 0.3); border-color: #3b82f6; }
+      50% { box-shadow: 0 0 25px rgba(96, 165, 250, 0.7); border-color: #93c5fd; }
+    }
+    .pulse-avatar {
+      animation: pulse-subtle 3s ease-in-out infinite;
+    }
+    .glow-thinking { animation: pulse-glow-thinking 1.5s infinite; }
+    .glow-speaking { animation: pulse-glow-speaking 1s infinite; }
+    .glow-listening { animation: pulse-glow-listening 2s infinite; }
+    
+    /* Custom Scrollbar */
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: #0f172a; }
+    ::-webkit-scrollbar-thumb { background: #334155; border-radius: 4px; }
+    ::-webkit-scrollbar-thumb:hover { background: #475569; }
+  </style>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen font-sans flex flex-col">
+
+  <!-- Header -->
+  <header class="border-b border-slate-900 bg-slate-900/50 backdrop-blur-md sticky top-0 z-50 px-6 py-4 flex items-center justify-between">
+    <div class="flex items-center space-x-3">
+      <div class="bg-indigo-600 p-2.5 rounded-xl shadow-lg shadow-indigo-600/30 flex items-center justify-center">
+        <i class="fa-solid fa-robot text-xl text-white"></i>
+      </div>
+      <div>
+        <h1 class="text-lg font-bold bg-gradient-to-r from-indigo-400 via-purple-400 to-pink-400 bg-clip-text text-transparent">
+          Humail Umar
+        </h1>
+        <p class="text-xs text-slate-400">Autonomous AI Interview Agent Dashboard</p>
+      </div>
+    </div>
+    
+    <div class="flex items-center space-x-4">
+      <div class="flex items-center space-x-2 bg-slate-900 px-3 py-1.5 rounded-lg border border-slate-800">
+        <span class="relative flex h-2.5 w-2.5">
+          <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+          <span class="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500"></span>
+        </span>
+        <span class="text-xs font-semibold uppercase text-slate-300 tracking-wider" id="server-status">System Connected</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- Main Grid Content -->
+  <main class="flex-grow p-6 grid grid-cols-1 lg:grid-cols-12 gap-6 max-w-7-xl mx-auto w-full">
+    
+    <!-- Left Column: Controller Card (4 cols) -->
+    <section class="lg:col-span-5 flex flex-col space-y-6">
+      
+      <!-- Controller Form -->
+      <div class="bg-slate-900/60 border border-slate-800/80 rounded-2xl p-6 shadow-xl backdrop-blur-md flex flex-col space-y-5">
+        <div class="flex items-center justify-between border-b border-slate-800/50 pb-3">
+          <div class="flex items-center space-x-2">
+            <i class="fa-solid fa-sliders text-indigo-400 text-lg"></i>
+            <h2 class="font-bold text-slate-200">Session Controller</h2>
+          </div>
+          <span class="text-xs text-slate-500 font-mono" id="agent-runtime">00:00:00</span>
+        </div>
+
+        <!-- Meeting URL -->
+        <div class="flex flex-col space-y-1.5">
+          <label class="text-xs font-bold uppercase tracking-wider text-slate-400">Meeting Link</label>
+          <div class="relative">
+            <span class="absolute inset-y-0 left-0 flex items-center pl-3.5 pointer-events-none text-slate-500">
+              <i class="fa-solid fa-link text-sm"></i>
+            </span>
+            <input type="text" id="meet-url" placeholder="https://meet.google.com/xxx-xxxx-xxx" 
+              class="w-full bg-slate-950/80 border border-slate-800 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 rounded-xl py-2.5 pl-10 pr-4 text-sm text-slate-100 placeholder-slate-600 transition-all outline-none">
+          </div>
+        </div>
+
+        <!-- Bot Name & LLM Provider -->
+        <div class="grid grid-cols-2 gap-4">
+          <div class="flex flex-col space-y-1.5">
+            <label class="text-xs font-bold uppercase tracking-wider text-slate-400">Candidate Name</label>
+            <input type="text" id="bot-name" value="Humail" 
+              class="w-full bg-slate-950/80 border border-slate-800 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 rounded-xl py-2.5 px-4 text-sm text-slate-100 outline-none transition-all">
+          </div>
+          <div class="flex flex-col space-y-1.5">
+            <label class="text-xs font-bold uppercase tracking-wider text-slate-400">LLM Brain</label>
+            <select id="llm-provider" 
+              class="w-full bg-slate-950/80 border border-slate-800 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 rounded-xl py-2.5 px-3 text-sm text-slate-100 outline-none transition-all cursor-pointer">
+              <option value="ollama">Ollama (Local)</option>
+              <option value="gemini" selected>Gemini (High Speed)</option>
+            </select>
+          </div>
+        </div>
+
+        <!-- Collapsible Candidate Persona -->
+        <div class="border border-slate-800/60 rounded-xl bg-slate-950/40 p-4">
+          <button onclick="togglePersona()" class="flex items-center justify-between w-full text-left text-slate-300 hover:text-indigo-400 transition-colors">
+            <span class="text-xs font-bold uppercase tracking-wider"><i class="fa-solid fa-id-card mr-2 text-indigo-400"></i>Customize Profile</span>
+            <i id="persona-chevron" class="fa-solid fa-chevron-down text-xs transition-transform"></i>
+          </button>
+          
+          <div id="persona-fields" class="hidden mt-4 flex flex-col space-y-3.5 border-t border-slate-800/40 pt-3">
+            <div class="flex flex-col space-y-1">
+              <label class="text-[10px] uppercase font-bold text-slate-500 tracking-wider">Education</label>
+              <input type="text" id="candidate-edu" value="Bachelor of Science in Artificial Intelligence & Computer Science"
+                class="w-full bg-slate-900 border border-slate-800/80 rounded-lg py-1.5 px-3 text-xs outline-none text-slate-300">
+            </div>
+            <div class="flex flex-col space-y-1">
+              <label class="text-[10px] uppercase font-bold text-slate-500 tracking-wider">Skills (Comma separated)</label>
+              <input type="text" id="candidate-skills" value="Python, FastAPI, WebSockets, Real-time audio pipelines, Ollama, Gemini, Voice cloning, Docker, Git"
+                class="w-full bg-slate-900 border border-slate-800/80 rounded-lg py-1.5 px-3 text-xs outline-none text-slate-300">
+            </div>
+            <div class="flex flex-col space-y-1">
+              <label class="text-[10px] uppercase font-bold text-slate-500 tracking-wider">Work Experience Summary</label>
+              <textarea id="candidate-exp" rows="3" 
+                class="w-full bg-slate-900 border border-slate-800/80 rounded-lg py-1.5 px-3 text-xs outline-none text-slate-300 resize-none">Expert AI Agent Developer and Software Engineer with experience in building autonomous systems, full-stack AI applications, meeting bots, and real-time audio/video AI pipelines.</textarea>
+            </div>
+          </div>
+        </div>
+
+        <!-- Start/Stop Buttons -->
+        <div class="flex flex-col space-y-3 pt-2">
+          <button id="btn-start" onclick="startAgent()" 
+            class="w-full bg-indigo-600 hover:bg-indigo-500 active:bg-indigo-700 text-white font-bold py-3 px-4 rounded-xl transition-all shadow-lg shadow-indigo-600/20 hover:shadow-indigo-500/30 flex items-center justify-center space-x-2">
+            <i class="fa-solid fa-play"></i>
+            <span>Initialize & Join Meeting</span>
+          </button>
+          
+          <button id="btn-stop" onclick="stopAgent()" disabled
+            class="w-full bg-rose-950/40 border border-rose-900/50 hover:bg-rose-900/30 active:bg-rose-950 text-rose-400 font-bold py-3 px-4 rounded-xl transition-all flex items-center justify-center space-x-2 disabled:opacity-30 disabled:cursor-not-allowed">
+            <i class="fa-solid fa-stop"></i>
+            <span>Stop Agent Session</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- Real-time Avatar Rendering State Monitor -->
+      <div class="bg-slate-900/40 border border-slate-800/60 rounded-2xl p-6 shadow-lg backdrop-blur-sm flex flex-col items-center justify-center py-8">
+        <div class="relative mb-4">
+          <!-- Pulse Ring Outer visual border -->
+          <div id="avatar-ring" class="w-40 h-40 rounded-full border-4 border-slate-800 flex items-center justify-center glow-listening transition-all duration-300">
+            <!-- Simulated Avatar Headshot -->
+            <div class="w-36 h-36 rounded-full overflow-hidden border-2 border-slate-950 bg-slate-900">
+              <img id="avatar-img" src="/static/placeholder-avatar.jpg" alt="Candidate Avatar" 
+                class="w-full h-full object-cover grayscale opacity-80 transition-all duration-300"
+                onerror="this.src='data:image/svg+xml,<svg xmlns=\'http://www.w3.org/2000/svg\' viewBox=\'0 0 100 100\'><circle cx=\'50\' cy=\'50\' r=\'45\' fill=\'%231e293b\'/><circle cx=\'50\' cy=\'40\' r=\'18\' fill=\'%23475569\'/><ellipse cx=\'50\' cy=\'75\' rx=\'28\' ry=\'20\' fill=\'%23475569\'/></svg>'">
+            </div>
+          </div>
+          <div class="absolute -bottom-2 left-1/2 -translate-x-1/2 bg-slate-950 border border-slate-800 rounded-full px-4 py-1 text-[10px] uppercase font-bold tracking-widest text-indigo-400 shadow-md flex items-center space-x-1.5">
+            <span class="flex h-2 w-2 relative">
+              <span id="state-ping" class="animate-ping absolute inline-flex h-full w-full rounded-full bg-indigo-400 opacity-75"></span>
+              <span id="state-dot" class="relative inline-flex rounded-full h-2 w-2 bg-indigo-500"></span>
+            </span>
+            <span id="state-label">listening</span>
+          </div>
+        </div>
+        
+        <div class="text-center mt-3">
+          <h3 class="font-bold text-slate-200" id="display-bot-name">Humail Umar</h3>
+          <p class="text-xs text-slate-500 font-semibold" id="connection-meta">Offline — Session Inactive</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- Right Column: Conversation Transcript & Activity Log (7 cols) -->
+    <section class="lg:col-span-7 flex flex-col bg-slate-900/60 border border-slate-800/80 rounded-2xl shadow-xl backdrop-blur-md min-h-[500px]">
+      
+      <!-- Top Bar tabs -->
+      <div class="flex items-center justify-between border-b border-slate-800/50 px-6 py-4">
+        <div class="flex items-center space-x-3">
+          <div class="bg-indigo-600/10 p-2 rounded-lg border border-indigo-500/20 text-indigo-400 flex items-center">
+            <i class="fa-solid fa-comment-dots text-md"></i>
+          </div>
+          <div>
+            <h2 class="font-bold text-slate-200">Live Interview Transcript</h2>
+            <p class="text-xs text-slate-500">Real-time transcripts, AI formulated replies & tokens</p>
+          </div>
+        </div>
+        
+        <button onclick="clearTranscript()" class="text-xs text-slate-500 hover:text-slate-300 font-semibold flex items-center space-x-1 border border-slate-800 hover:border-slate-700 bg-slate-950 px-2.5 py-1.5 rounded-lg transition-all">
+          <i class="fa-solid fa-trash"></i>
+          <span>Clear Feed</span>
+        </button>
+      </div>
+
+      <!-- Transcript Feed Body -->
+      <div id="transcript-feed" class="flex-grow p-6 overflow-y-auto max-h-[580px] flex flex-col space-y-4">
+        
+        <!-- Starter Bubble -->
+        <div class="flex items-start space-x-3" id="empty-feed-placeholder">
+          <div class="bg-slate-800 p-2 rounded-full text-slate-400 text-xs flex items-center justify-center w-8 h-8">
+            <i class="fa-solid fa-info"></i>
+          </div>
+          <div class="bg-slate-900/80 rounded-2xl p-4 text-xs text-slate-400 max-w-[85%] border border-slate-800/40">
+            Welcome to the AI Candidate Interview control interface. 
+            When you enter a Google Meet link and hit <strong>Join Meeting</strong>, the live audio stream transcripts and formulated replies will be displayed here in real time.
+          </div>
+        </div>
+      </div>
+
+      <!-- Live Token Stream Indicator -->
+      <div id="typing-indicator" class="hidden border-t border-slate-800/40 px-6 py-3 bg-slate-950/50 flex items-center justify-between">
+        <div class="flex items-center space-x-2 text-indigo-400 text-xs font-semibold animate-pulse">
+          <i class="fa-solid fa-brain"></i>
+          <span id="typing-label">Brain is generating answer...</span>
+        </div>
+        <div class="flex space-x-1">
+          <span class="w-1.5 h-1.5 bg-indigo-400 rounded-full animate-bounce" style="animation-delay: 0ms"></span>
+          <span class="w-1.5 h-1.5 bg-indigo-400 rounded-full animate-bounce" style="animation-delay: 150ms"></span>
+          <span class="w-1.5 h-1.5 bg-indigo-400 rounded-full animate-bounce" style="animation-delay: 300ms"></span>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- Footer -->
+  <footer class="border-t border-slate-900 bg-slate-900/20 py-4 text-center text-xs text-slate-600 font-semibold mt-auto">
+    Humail Umar — Autonomous AI Interview Agent © 2026. Powered by AgentCall & PikaStream 1.0.
+  </footer>
+
+  <!-- WebSocket & API Frontend Logic -->
+  <script>
+    let ws = null;
+    let timerInterval = null;
+    let secondsElapsed = 0;
+    
+    // Auto-fill meeting url if present in localstorage or use config
+    document.addEventListener("DOMContentLoaded", () => {
+      const savedUrl = localStorage.getItem("last_meet_url");
+      if (savedUrl) {
+        document.getElementById("meet-url").value = savedUrl;
+      }
+      
+      // Connect status socket
+      connectWebSocket();
+    });
+
+    // Toggle Persona customization details
+    function togglePersona() {
+      const fields = document.getElementById("persona-fields");
+      const chevron = document.getElementById("persona-chevron");
+      fields.classList.toggle("hidden");
+      chevron.classList.toggle("rotate-180");
+    }
+
+    // Connect WebSocket
+    function connectWebSocket() {
+      // Connect to the generic 'active' session socket
+      const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+      const wsUrl = `${wsProtocol}//${window.location.host}/ws/session/active`;
+      
+      console.log(`Connecting Status WebSocket: ${wsUrl}`);
+      ws = new WebSocket(wsUrl);
+
+      ws.onopen = () => {
+        document.getElementById("server-status").textContent = "Live Stream Connected";
+        document.getElementById("server-status").className = "text-xs font-semibold uppercase text-slate-300 tracking-wider";
+      };
+
+      ws.onclose = () => {
+        document.getElementById("server-status").textContent = "Reconnecting...";
+        document.getElementById("server-status").className = "text-xs font-semibold uppercase text-amber-500 tracking-wider animate-pulse";
+        setTimeout(connectWebSocket, 3000); // Auto reconnect
+      };
+
+      ws.onerror = (err) => {
+        console.error("WebSocket Error:", err);
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+          console.log("WebSocket Event:", msg);
+          handleWebSocketMessage(msg);
+        } catch(e) {
+          console.warn("Non-JSON ws msg:", event.data);
+        }
+      };
+    }
+
+    // Handle incoming messages
+    function handleWebSocketMessage(msg) {
+      const feed = document.getElementById("transcript-feed");
+      const placeholder = document.getElementById("empty-feed-placeholder");
+      if (placeholder) placeholder.remove();
+
+      // State Transitions
+      if (msg.event === "state_change") {
+        updateAvatarState(msg.state);
+      }
+      
+      // Real-time Interviewer Transcript
+      else if (msg.event === "question_received") {
+        appendChatBubble("Interviewer", msg.text);
+      }
+
+      // Brain streaming response (tokens)
+      else if (msg.event === "brain_stream_token") {
+        document.getElementById("typing-indicator").classList.remove("hidden");
+        appendTokenToActiveResponse(msg.text);
+      }
+      
+      // Brain full response final
+      else if (msg.event === "brain_response_done") {
+        document.getElementById("typing-indicator").classList.add("hidden");
+        finalizeActiveResponse(msg.text);
+      }
+    }
+
+    // Append Chat Bubble
+    function appendChatBubble(speaker, text) {
+      const feed = document.getElementById("transcript-feed");
+      const bubbleId = `bubble-${Date.now()}`;
+      
+      const isCandidate = speaker.toLowerCase() !== "interviewer";
+      const alignClass = isCandidate ? "justify-end" : "justify-start";
+      const bgClass = isCandidate 
+        ? "bg-indigo-600/90 text-white rounded-tr-none border border-indigo-500/30" 
+        : "bg-slate-900 text-slate-100 rounded-tl-none border border-slate-800/80";
+        
+      const icon = isCandidate ? "fa-user-tie text-indigo-400" : "fa-microphone text-slate-400";
+      
+      const card = `
+        <div class="flex items-start space-x-3 ${alignClass}" id="${bubbleId}">
+          ${!isCandidate ? `
+            <div class="bg-slate-800 p-2 rounded-full w-8 h-8 flex items-center justify-center text-xs text-slate-300">
+              <i class="fa-solid ${icon}"></i>
+            </div>
+          ` : ''}
+          <div class="${bgClass} rounded-2xl p-4 text-sm max-w-[85%] shadow-md">
+            <div class="flex items-center space-x-2 mb-1">
+              <span class="text-[10px] font-bold uppercase tracking-wider ${isCandidate ? 'text-indigo-200' : 'text-slate-400'}">${speaker}</span>
+              <span class="text-[9px] text-slate-500">${new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit', second: '2-digit'})}</span>
+            </div>
+            <div class="chat-text whitespace-pre-wrap">${text}</div>
+          </div>
+          ${isCandidate ? `
+            <div class="bg-indigo-600/10 border border-indigo-500/20 p-2 rounded-full w-8 h-8 flex items-center justify-center text-xs text-indigo-400">
+              <i class="fa-solid ${icon}"></i>
+            </div>
+          ` : ''}
+        </div>
+      `;
+      
+      feed.insertAdjacentHTML("beforeend", card);
+      feed.scrollTop = feed.scrollHeight;
+    }
+
+    let activeCandidateBubbleId = null;
+
+    // Token append helper
+    function appendTokenToActiveResponse(token) {
+      const feed = document.getElementById("transcript-feed");
+      
+      if (!activeCandidateBubbleId) {
+        // Create new bubble
+        activeCandidateBubbleId = `candidate-bubble-${Date.now()}`;
+        const name = document.getElementById("bot-name").value || "Humail";
+        
+        const card = `
+          <div class="flex items-start space-x-3 justify-end" id="${activeCandidateBubbleId}">
+            <div class="bg-indigo-600/90 text-white rounded-2xl rounded-tr-none border border-indigo-500/30 p-4 text-sm max-w-[85%] shadow-md">
+              <div class="flex items-center space-x-2 mb-1">
+                <span class="text-[10px] font-bold uppercase tracking-wider text-indigo-200">${name}</span>
+                <span class="text-[9px] text-slate-500">Formulating...</span>
+              </div>
+              <div class="chat-text whitespace-pre-wrap" id="${activeCandidateBubbleId}-text"></div>
+            </div>
+            <div class="bg-indigo-600/10 border border-indigo-500/20 p-2 rounded-full w-8 h-8 flex items-center justify-center text-xs text-indigo-400">
+              <i class="fa-solid fa-user-tie"></i>
+            </div>
+          </div>
+        `;
+        feed.insertAdjacentHTML("beforeend", card);
+      }
+      
+      const textNode = document.getElementById(`${activeCandidateBubbleId}-text`);
+      if (textNode) {
+        textNode.textContent += token;
+      }
+      feed.scrollTop = feed.scrollHeight;
+    }
+
+    function finalizeActiveResponse(fullText) {
+      if (activeCandidateBubbleId) {
+        const textNode = document.getElementById(`${activeCandidateBubbleId}-text`);
+        if (textNode) {
+          textNode.textContent = fullText;
+        }
+        activeCandidateBubbleId = null;
+      }
+    }
+
+    // Reset Feed
+    function clearTranscript() {
+      document.getElementById("transcript-feed").innerHTML = `
+        <div class="flex items-start space-x-3" id="empty-feed-placeholder">
+          <div class="bg-slate-800 p-2 rounded-full text-slate-400 text-xs flex items-center justify-center w-8 h-8">
+            <i class="fa-solid fa-trash-can"></i>
+          </div>
+          <div class="bg-slate-900/80 rounded-2xl p-4 text-xs text-slate-400 max-w-[85%] border border-slate-800/40">
+            Feed cleared. Waiting for meeting audio transcripts...
+          </div>
+        </div>
+      `;
+    }
+
+    // Start Agent API POST
+    async function startAgent() {
+      const meetUrl = document.getElementById("meet-url").value.strip();
+      const botName = document.getElementById("bot-name").value.strip();
+      const llmProvider = document.getElementById("llm-provider").value;
+      
+      if (!meetUrl) {
+        alert("Please enter a valid Google Meet or Zoom URL before joining.");
+        return;
+      }
+      
+      // Save meeting url to localStorage
+      localStorage.setItem("last_meet_url", meetUrl);
+
+      // Disable Start and enable Stop button
+      document.getElementById("btn-start").disabled = true;
+      document.getElementById("btn-start").innerHTML = `<i class="fa-solid fa-circle-notch animate-spin"></i><span>Joining...</span>`;
+      
+      // Package candidate profile custom parameters
+      const payload = {
+        meeting_url: meetUrl,
+        bot_name: botName,
+        llm_provider: llmProvider,
+        candidate_data: {
+          name: botName,
+          education: document.getElementById("candidate-edu").value,
+          experience: document.getElementById("candidate-exp").value,
+          skills: document.getElementById("candidate-skills").value.split(",").map(s => s.trim())
+        }
+      };
+
+      try {
+        const resp = await fetch("/start", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        
+        const data = await resp.json();
+        if (resp.ok) {
+          console.log("Agent started:", data);
+          document.getElementById("btn-stop").disabled = false;
+          document.getElementById("display-bot-name").textContent = botName;
+          document.getElementById("connection-meta").textContent = `Call Active — Joining meeting`;
+          updateAvatarState("starting");
+          startTimer();
+        } else {
+          alert(`Failed to start agent: ${data.detail || "Unknown error"}`);
+          resetControlUI();
+        }
+      } catch(e) {
+        console.error(e);
+        alert("Error connecting to server to join meeting.");
+        resetControlUI();
+      }
+    }
+
+    // Stop Agent API POST
+    async function stopAgent() {
+      document.getElementById("btn-stop").disabled = true;
+      document.getElementById("btn-stop").innerHTML = `<i class="fa-solid fa-circle-notch animate-spin"></i><span>Leaving...</span>`;
+
+      try {
+        const resp = await fetch("/stop", { method: "POST" });
+        if (resp.ok) {
+          console.log("Agent stopped");
+          resetControlUI();
+          updateAvatarState("stopped");
+        } else {
+          alert("Failed to stop the active session.");
+          document.getElementById("btn-stop").disabled = false;
+          document.getElementById("btn-stop").innerHTML = `<i class="fa-solid fa-stop"></i><span>Stop Agent Session</span>`;
+        }
+      } catch(e) {
+        console.error(e);
+        resetControlUI();
+      }
+    }
+
+    function resetControlUI() {
+      document.getElementById("btn-start").disabled = false;
+      document.getElementById("btn-start").innerHTML = `<i class="fa-solid fa-play"></i><span>Initialize & Join Meeting</span>`;
+      
+      document.getElementById("btn-stop").disabled = true;
+      document.getElementById("btn-stop").innerHTML = `<i class="fa-solid fa-stop"></i><span>Stop Agent Session</span>`;
+      
+      document.getElementById("connection-meta").textContent = "Offline — Session Inactive";
+      stopTimer();
+    }
+
+    // Update Avatar visualization ring glow classes and labels
+    function updateAvatarState(state) {
+      const ring = document.getElementById("avatar-ring");
+      const label = document.getElementById("state-label");
+      const dot = document.getElementById("state-dot");
+      const ping = document.getElementById("state-ping");
+      const img = document.getElementById("avatar-img");
+      
+      // Clean previous classes
+      ring.className = "w-40 h-40 rounded-full border-4 border-slate-800 flex items-center justify-center transition-all duration-300";
+      dot.className = "relative inline-flex rounded-full h-2 w-2";
+      ping.className = "animate-ping absolute inline-flex h-full w-full rounded-full opacity-75";
+      img.className = "w-full h-full object-cover transition-all duration-300 grayscale opacity-80";
+      
+      label.textContent = state.replace(/_/g, ' ');
+
+      if (state === "listening") {
+        ring.classList.add("glow-listening");
+        dot.classList.add("bg-blue-500");
+        ping.classList.add("bg-blue-400");
+        img.classList.remove("grayscale");
+        img.classList.add("opacity-100");
+      }
+      else if (state === "thinking") {
+        ring.classList.add("glow-thinking");
+        dot.classList.add("bg-purple-500");
+        ping.classList.add("bg-purple-400");
+        img.classList.add("grayscale-50");
+      }
+      else if (state === "speaking") {
+        ring.classList.add("glow-speaking");
+        dot.classList.add("bg-emerald-500");
+        ping.classList.add("bg-emerald-400");
+        img.classList.remove("grayscale");
+        img.classList.add("opacity-100");
+      }
+      else if (state === "starting") {
+        ring.classList.add("border-indigo-500/60");
+        dot.classList.add("bg-indigo-500");
+        ping.classList.add("bg-indigo-400");
+      }
+      else if (state === "stopped" || state === "idle") {
+        ring.classList.add("border-slate-800");
+        dot.classList.add("bg-slate-600");
+        ping.classList.add("bg-slate-500");
+        label.textContent = "offline";
+      }
+    }
+
+    // Timer functions for active session runtime
+    function startTimer() {
+      secondsElapsed = 0;
+      clearInterval(timerInterval);
+      timerInterval = setInterval(() => {
+        secondsElapsed++;
+        const hrs = String(Math.floor(secondsElapsed / 3600)).padStart(2, '0');
+        const mins = String(Math.floor((secondsElapsed % 3600) / 60)).padStart(2, '0');
+        const secs = String(secondsElapsed % 60).padStart(2, '0');
+        document.getElementById("agent-runtime").textContent = `${hrs}:${mins}:${secs}`;
+      }, 1000);
+    }
+
+    function stopTimer() {
+      clearInterval(timerInterval);
+      document.getElementById("agent-runtime").textContent = "00:00:00";
+    }
+  </script>
+</body>
+</html>

@@ -1,7 +1,11 @@
 import asyncio
 import logging
+import os
+import sys
+from pathlib import Path
 from typing import Dict, List, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, BackgroundTasks
+from fastapi.responses import HTMLResponse, FileResponse
 from pydantic import BaseModel
 import uvicorn
 
@@ -54,8 +58,7 @@ class ConnectionManager:
     async def broadcast(self, session_id: str, message: dict):
         """Broadcasts JSON updates to all websocket listeners of a session."""
         targets = self.active_connections.get(session_id, [])
-        # Also broadcast to "all" listeners
-        all_targets = self.active_connections.get("all", [])
+        all_targets = self.active_connections.get("active", []) + self.active_connections.get("all", [])
         
         for ws in targets + all_targets:
             try:
@@ -73,34 +76,54 @@ class StartAgentRequest(BaseModel):
     llm_provider: Optional[str] = "ollama"  # "ollama" or "gemini"
     candidate_data: Optional[dict] = None
 
-# Callback trigger to broadcast orchestrator state changes over WebSocket
-async def orchestrator_status_callback(payload: dict):
-    session_id = "active"
-    if state.orchestrator and state.orchestrator.session:
-        session_id = state.orchestrator.session.get("call_id", "active")
-    
-    # Broadcast event
-    await manager.broadcast(session_id, payload)
-
 async def run_orchestrator_background(orchestrator: InterviewAgentOrchestrator):
-    """Asynchronous background wrapper that executes the agent's main loop."""
+    """Asynchronous background wrapper that executes the agent's main loop and hooks WebSockets."""
     try:
         state.current_status = "interviewing"
-        # Overwrite orchestrator status updates to connect with WebSocket broadcasting
-        # We hook into process_question and other phases to emit updates
-        original_process_question = orchestrator._process_question
+        session_id = "active"
         
+        # Intercept process_question to capture and stream tokens to WebSocket
         async def hooked_process_question(question: str):
-            session_id = orchestrator.session.get("call_id", "active") if orchestrator.session else "active"
+            nonlocal session_id
+            if orchestrator.session:
+                session_id = orchestrator.session.get("call_id", "active")
+                
+            # 1. Broadcast question to WebSockets
             await manager.broadcast(session_id, {
                 "event": "question_received",
                 "text": question,
                 "speaker": "Interviewer"
             })
             
-            # Update state to thinking and broadcast
+            # 2. Transition state to 'thinking'
             await manager.broadcast(session_id, {"event": "state_change", "state": "thinking"})
-            await original_process_question(question)
+            await orchestrator.session["client"].send_command({"type": "voice.state_update", "state": "thinking"})
+            
+            # 3. Generate answer and stream tokens to WebSocket
+            response_text = ""
+            async for chunk in orchestrator.brain.generate_answer(question):
+                response_text += chunk
+                sys.stdout.write(chunk)
+                sys.stdout.flush()
+                # Broadcast real-time token
+                await manager.broadcast(session_id, {
+                    "event": "brain_stream_token",
+                    "text": chunk
+                })
+            sys.stdout.write("\n")
+            
+            # 4. Finalize brain generation and transition to 'speaking'
+            await manager.broadcast(session_id, {
+                "event": "brain_response_done",
+                "text": response_text
+            })
+            await manager.broadcast(session_id, {"event": "state_change", "state": "speaking"})
+            
+            # 5. Play cloned voice into meeting
+            if response_text.strip():
+                await orchestrator.cloner.speak(orchestrator.session["client"], response_text)
+                
+            # 6. Reset state to 'listening'
             await manager.broadcast(session_id, {"event": "state_change", "state": "listening"})
 
         orchestrator._process_question = hooked_process_question
@@ -115,8 +138,24 @@ async def run_orchestrator_background(orchestrator: InterviewAgentOrchestrator):
         state.orchestrator_task = None
         logger.info("Agent background task completed.")
 
+# HTML Frontend Serve Route
+@app.get("/", response_class=HTMLResponse, summary="Renders the AI Interview Dashboard UI")
+async def serve_dashboard():
+    frontend_path = Path(__file__).resolve().parent / "frontend" / "index.html"
+    if frontend_path.exists():
+        return HTMLResponse(content=frontend_path.read_text(), status_code=200)
+    return HTMLResponse(content="<h1>Dashboard Frontend File Not Found</h1>", status_code=404)
+
+# Static File Route for Avatar Images
+@app.get("/static/placeholder-avatar.jpg", summary="Serves the default candidate avatar image")
+async def serve_avatar():
+    img_path = Path(config.AVATAR_IMAGE_PATH)
+    if img_path.exists():
+        return FileResponse(img_path)
+    return FileResponse(Path(__file__).resolve().parent / "Pika-Skills" / "pikastream-video-meeting" / "assets" / "placeholder-avatar.jpg")
+
 @app.post("/start", summary="Starts the AI Interview Agent")
-async def start_agent(request: StartAgentRequest, background_tasks: BackgroundTasks):
+async def start_agent(request: StartAgentRequest):
     if state.orchestrator_task and not state.orchestrator_task.done():
         raise HTTPException(status_code=400, detail="Agent is already running.")
 
