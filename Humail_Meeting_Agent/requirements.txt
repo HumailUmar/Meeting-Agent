@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+websockets
+aiohttp
+ollama
+TTS
+sounddevice
+playwright
+python-dotenv
