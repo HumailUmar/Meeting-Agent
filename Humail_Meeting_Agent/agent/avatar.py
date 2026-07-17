@@ -17,11 +17,12 @@ PIKA_SCRIPT_PATH = BASE_DIR / "Pika-Skills" / "pikastream-video-meeting" / "scri
 class AvatarManager:
     """
     Manages the integration with Pika's real-time lip-synced video meeting avatar skill.
-    Uses the underlying `pikastreaming_videomeeting.py` script to control the avatar.
+    Uses the underlying pikastreaming_videomeeting.py script to control the avatar.
     """
     def __init__(self, pika_dev_key: Optional[str] = None):
         self.pika_dev_key = pika_dev_key or config.PIKA_DEV_KEY or os.environ.get("PIKA_DEV_KEY")
         self.active_session_id = None
+        self.process = None # Subprocess instance tracked to prevent leaks/zombies
 
     async def join_avatar_meeting(
         self, 
@@ -39,7 +40,7 @@ class AvatarManager:
             meet_url (str): Google Meet or Zoom link.
             bot_name (str): The meeting display name for the bot.
             image_path (str): Path to the avatar headshot image.
-            voice_id (str, optional): The Pika voice ID to use.
+            voice_id (str, calendar, optional): The Pika voice ID to use.
             system_prompt (str, optional): The system prompt for conversational guidance.
             
         Returns:
@@ -49,7 +50,7 @@ class AvatarManager:
             logger.error("PIKA_DEV_KEY is missing. Unable to join Pika avatar meeting.")
             return None
 
-        # Resolve image path
+        # Resolve image path safely
         if not os.path.exists(image_path):
             logger.error(f"Avatar headshot image not found at: {image_path}")
             return None
@@ -74,8 +75,11 @@ class AvatarManager:
         logger.info(f"Spawning Pika meeting joining subprocess...")
         
         try:
-            # Start asynchronous subprocess to capture stdout/stderr in real-time
-            process = await asyncio.create_subprocess_exec(
+            # Terminate any existing running process before starting a new one
+            await self._kill_process()
+
+            # Start asynchronous subprocess
+            self.process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -85,7 +89,7 @@ class AvatarManager:
             session_id = None
             
             while True:
-                line_bytes = await process.stdout.readline()
+                line_bytes = await self.process.stdout.readline()
                 if not line_bytes:
                     break
                 
@@ -115,27 +119,33 @@ class AvatarManager:
                         break
                         
                 except json.JSONDecodeError:
-                    # Output raw debug messages if not JSON
                     logger.info(f"[PikaStream Raw] {line}")
             
             # Read stderr if process failed early
-            stderr_bytes = await process.stderr.read()
+            stderr_bytes = await self.process.stderr.read()
             if stderr_bytes:
                 logger.error(f"[PikaStream Stderr Error] {stderr_bytes.decode('utf-8')}")
 
+            # Cleanup process if it failed to get ready
+            await self._kill_process()
             return session_id
 
         except Exception as e:
             logger.error(f"Error while joining Pika avatar meeting: {e}")
+            await self._kill_process()
             return None
 
     async def leave_avatar_meeting(self, session_id: Optional[str] = None) -> bool:
         """
-        Triggers Pika's leave command to shut down the avatar session.
+        Triggers Pika's leave command to shut down the avatar session and kills local processes.
         """
         sid = session_id or self.active_session_id
+        
+        # Kill the local active running process
+        await self._kill_process()
+
         if not sid:
-            logger.warning("No active session ID found to trigger leave.")
+            logger.warning("No active session ID found to trigger leave command.")
             return False
 
         if not self.pika_dev_key:
@@ -171,6 +181,24 @@ class AvatarManager:
         except Exception as e:
             logger.error(f"Exception during Pika leave session: {e}")
             return False
+
+    async def _kill_process(self):
+        """Safely terminates and reaps the spawned subprocess to prevent zombie leaks."""
+        if self.process:
+            logger.info("Reaping Pika subprocess to prevent memory leak...")
+            try:
+                self.process.terminate()
+                # Wait up to 5s for clean shutdown, then force kill
+                try:
+                    await asyncio.wait_for(self.process.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    logger.warning("Pika subprocess didn't exit cleanly. Sending SIGKILL...")
+                    self.process.kill()
+                    await self.process.wait()
+            except Exception as e:
+                logger.debug(f"Error while reaping process: {e}")
+            finally:
+                self.process = None
 
     async def generate_avatar_image(self, output_path: str, prompt: Optional[str] = None) -> bool:
         """
