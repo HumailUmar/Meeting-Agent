@@ -1,10 +1,11 @@
 import asyncio
 import logging
 import os
+import shutil
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, BackgroundTasks
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, BackgroundTasks, UploadFile, File
 from fastapi.responses import HTMLResponse, FileResponse
 from pydantic import BaseModel
 import uvicorn
@@ -21,7 +22,7 @@ logger = logging.getLogger("API-Server")
 app = FastAPI(
     title="Autonomous AI Interview Agent API",
     description="REST & WebSocket API to coordinate and track the AI Interview Candidate Agent.",
-    version="1.0.0"
+    version="1.5.0"
 )
 
 # In-memory storage for active sessions and orchestrator tasks
@@ -153,6 +154,44 @@ async def serve_avatar():
     if img_path.exists():
         return FileResponse(img_path)
     return FileResponse(Path(__file__).resolve().parent / "Pika-Skills" / "pikastream-video-meeting" / "assets" / "placeholder-avatar.jpg")
+
+# Picture Upload Endpoint
+@app.post("/upload/avatar", summary="Upload a custom avatar image")
+async def upload_avatar(file: UploadFile = File(...)):
+    # Validate extension
+    ext = os.path.splitext(file.filename)[1].lower()
+    if ext not in [".png", ".jpg", ".jpeg"]:
+        raise HTTPException(status_code=400, detail="Only PNG, JPG, or JPEG images are supported.")
+    
+    # Ensure directory exists
+    os.makedirs(os.path.dirname(config.AVATAR_IMAGE_PATH), exist_ok=True)
+    
+    try:
+        with open(config.AVATAR_IMAGE_PATH, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        logger.info(f"Custom avatar image uploaded successfully: {config.AVATAR_IMAGE_PATH}")
+        return {"status": "success", "file_path": config.AVATAR_IMAGE_PATH}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save avatar image: {e}")
+
+# Audio Upload Endpoint
+@app.post("/upload/voice", summary="Upload a reference voice sample for cloning")
+async def upload_voice(file: UploadFile = File(...)):
+    # Validate extension
+    ext = os.path.splitext(file.filename)[1].lower()
+    if ext not in [".wav", ".mp3", ".m4a", ".ogg", ".flac"]:
+        raise HTTPException(status_code=400, detail="Unsupported audio format. Use WAV, MP3, M4A, OGG, or FLAC.")
+    
+    # Ensure directory exists
+    os.makedirs(os.path.dirname(config.VOICE_SAMPLE_PATH), exist_ok=True)
+    
+    try:
+        with open(config.VOICE_SAMPLE_PATH, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        logger.info(f"Custom voice sample uploaded successfully: {config.VOICE_SAMPLE_PATH}")
+        return {"status": "success", "file_path": config.VOICE_SAMPLE_PATH}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save voice sample: {e}")
 
 @app.post("/start", summary="Starts the AI Interview Agent")
 async def start_agent(request: StartAgentRequest):
