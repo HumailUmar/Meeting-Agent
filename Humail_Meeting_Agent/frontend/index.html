@@ -352,6 +352,9 @@
     let ws = null;
     let timerInterval = null;
     let secondsElapsed = 0;
+    let activeCandidateBubbleId = null;
+    let reconnectAttempts = 0;
+    const MAX_RECONNECT_ATTEMPTS = 10;
     
     // Auto-fill inputs on load
     document.addEventListener("DOMContentLoaded", () => {
@@ -370,22 +373,34 @@
     // Helper to refresh avatar headshot preview
     function refreshAvatarPreview() {
       const avatarImg = document.getElementById("avatar-img");
+      if (!avatarImg) return;
       // Add a timestamp to bypass browser caching and reload the uploaded image
-      avatarImg.src = "/static/placeholder-avatar.jpg?t=" + Date.now();
+      const baseUrl = "/static/placeholder-avatar.jpg";
+      avatarImg.src = baseUrl + "?t=" + Date.now();
+      
+      // Handle broken image gracefully
+      avatarImg.onerror = function() {
+        this.src = 'data:image/svg+xml,<svg xmlns=\'http://www.w3.org/2000/svg\' viewBox=\'0 0 100 100\'><circle cx=\'50\' cy=\'50\' r=\'45\' fill=\'%231e293b\'/><circle cx=\'50\' cy=\'40\' r=\'18\' fill=\'%23475569\'/><ellipse cx=\'50\' cy=\'75\' rx=\'28\' ry=\'20\' fill=\'%23475569\'/></svg>';
+      };
     }
 
     // Toggle Collapsible Sections
     function toggleSection(panelId, chevronId) {
       const fields = document.getElementById(panelId);
       const chevron = document.getElementById(chevronId);
-      fields.classList.toggle("hidden");
-      chevron.classList.toggle("rotate-180");
+      if (fields && chevron) {
+        fields.classList.toggle("hidden");
+        chevron.classList.toggle("rotate-180");
+      }
     }
 
     // Toggle Switches (Barge-in / Noise filter)
     function toggleSwitch(switchId) {
       const btn = document.getElementById(switchId);
+      if (!btn) return;
       const span = btn.querySelector("span");
+      if (!span) return;
+      
       const isActive = btn.classList.contains("bg-indigo-600");
 
       if (isActive) {
@@ -402,18 +417,36 @@
       const fileInput = document.getElementById("upload-prompt-input");
       const label = document.getElementById("prompt-file-label");
       
+      if (!fileInput || !label) return;
       if (fileInput.files.length === 0) return;
+      
       const file = fileInput.files[0];
+      
+      // Validate file size (max 100KB for text)
+      if (file.size > 100 * 1024) {
+        alert("Prompt file is too large. Maximum size is 100KB.");
+        return;
+      }
+      
       label.textContent = file.name;
 
       const reader = new FileReader();
       reader.onload = function(e) {
         const text = e.target.result;
         // Populate experience text area with prompt contents
-        document.getElementById("candidate-exp").value = text;
+        const expField = document.getElementById("candidate-exp");
+        if (expField) {
+          expField.value = text;
+        }
         // Automatically open the profile card to let the user review it
-        document.getElementById("persona-panel").classList.remove("hidden");
-        document.getElementById("persona-chevron").classList.add("rotate-180");
+        const personaPanel = document.getElementById("persona-panel");
+        const personaChevron = document.getElementById("persona-chevron");
+        if (personaPanel) personaPanel.classList.remove("hidden");
+        if (personaChevron) personaChevron.classList.add("rotate-180");
+      };
+      reader.onerror = function() {
+        label.textContent = "✗ Read error";
+        label.className = "text-[11px] text-rose-400 font-bold";
       };
       reader.readAsText(file);
     }
@@ -423,9 +456,19 @@
       const fileInput = document.getElementById(type === "avatar" ? "upload-avatar-input" : "upload-voice-input");
       const label = document.getElementById(type === "avatar" ? "avatar-file-label" : "voice-file-label");
       
+      if (!fileInput || !label) return;
       if (fileInput.files.length === 0) return;
       
       const file = fileInput.files[0];
+      
+      // Validate file size
+      const maxSize = type === "avatar" ? 5 * 1024 * 1024 : 10 * 1024 * 1024;
+      const maxLabel = type === "avatar" ? "5MB" : "10MB";
+      if (file.size > maxSize) {
+        alert(`File is too large. Maximum size is ${maxLabel}.`);
+        return;
+      }
+      
       label.innerHTML = `<i class="fa-solid fa-spinner animate-spin text-[10px]"></i> Uploading...`;
 
       const formData = new FormData();
@@ -451,7 +494,7 @@
           alert(`Failed to save file: ${data.detail || "Unknown error"}`);
         }
       } catch(e) {
-        console.error(e);
+        console.error("Upload error:", e);
         label.textContent = "✗ Connection Error";
         label.className = "text-[11px] text-rose-400 font-bold";
       }
@@ -459,6 +502,10 @@
 
     // Connect Status and event stream WebSockets
     function connectWebSocket() {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        return; // Already connected
+      }
+      
       const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
       const wsUrl = `${wsProtocol}//${window.location.host}/ws/session/active`;
       
@@ -466,52 +513,84 @@
       ws = new WebSocket(wsUrl);
 
       ws.onopen = () => {
-        document.getElementById("server-status").textContent = "Live Stream Connected";
-        document.getElementById("server-status").className = "text-xs font-bold uppercase text-slate-300 tracking-wider";
+        reconnectAttempts = 0; // Reset on successful connection
+        const statusEl = document.getElementById("server-status");
+        if (statusEl) {
+          statusEl.textContent = "Live Stream Connected";
+          statusEl.className = "text-xs font-bold uppercase text-slate-300 tracking-wider";
+        }
       };
 
       ws.onclose = () => {
-        document.getElementById("server-status").textContent = "Reconnecting...";
-        document.getElementById("server-status").className = "text-xs font-bold uppercase text-amber-500 tracking-wider animate-pulse";
-        setTimeout(connectWebSocket, 3000);
+        const statusEl = document.getElementById("server-status");
+        if (statusEl) {
+          statusEl.textContent = "Reconnecting...";
+          statusEl.className = "text-xs font-bold uppercase text-amber-500 tracking-wider animate-pulse";
+        }
+        
+        // Prevent infinite reconnection storm
+        if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+          reconnectAttempts++;
+          console.log(`Reconnecting... attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS}`);
+          setTimeout(connectWebSocket, 3000 * reconnectAttempts); // Exponential backoff
+        } else {
+          console.error("Max reconnection attempts reached");
+          if (statusEl) {
+            statusEl.textContent = "Connection Lost";
+            statusEl.className = "text-xs font-bold uppercase text-rose-500 tracking-wider";
+          }
+        }
       };
 
       ws.onerror = (err) => {
         console.error("WebSocket Error:", err);
+        ws.close(); // Trigger onclose handler
       };
 
       ws.onmessage = (event) => {
         try {
           const msg = JSON.parse(event.data);
-          handleWebSocketMessage(msg);
-        } catch(e) {}
+          if (msg && typeof msg === 'object') {
+            handleWebSocketMessage(msg);
+          }
+        } catch(e) {
+          console.warn("Failed to parse WebSocket message:", e);
+        }
       };
     }
 
     function handleWebSocketMessage(msg) {
+      if (!msg || !msg.event) return;
+      
       const feed = document.getElementById("transcript-feed");
       const placeholder = document.getElementById("empty-feed-placeholder");
-      if (placeholder) placeholder.remove();
+      if (placeholder && placeholder.parentNode === feed) {
+        placeholder.remove();
+      }
 
       if (msg.event === "state_change") {
         updateAvatarState(msg.state);
       }
       else if (msg.event === "question_received") {
-        appendChatBubble("Interviewer", msg.text);
+        appendChatBubble("Interviewer", msg.text || "");
       }
       else if (msg.event === "brain_stream_token") {
-        document.getElementById("typing-indicator").classList.remove("hidden");
-        appendTokenToActiveResponse(msg.text);
+        const indicator = document.getElementById("typing-indicator");
+        if (indicator) indicator.classList.remove("hidden");
+        appendTokenToActiveResponse(msg.text || "");
       }
       else if (msg.event === "brain_response_done") {
-        document.getElementById("typing-indicator").classList.add("hidden");
-        finalizeActiveResponse(msg.text);
+        const indicator = document.getElementById("typing-indicator");
+        if (indicator) indicator.classList.add("hidden");
+        finalizeActiveResponse(msg.text || "");
       }
     }
 
     // Append Bubble
     function appendChatBubble(speaker, text) {
       const feed = document.getElementById("transcript-feed");
+      if (!feed) return;
+      
       const bubbleId = `bubble-${Date.now()}`;
       
       const isCandidate = speaker.toLowerCase() !== "interviewer";
@@ -521,6 +600,8 @@
         : "bg-slate-900 text-slate-100 rounded-tl-none border border-slate-800/80";
         
       const icon = isCandidate ? "fa-user-tie text-indigo-400" : "fa-microphone text-slate-400";
+      
+      const timeStr = new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit', second: '2-digit'});
       
       const card = `
         <div class="flex items-start space-x-3 ${alignClass}" id="${bubbleId}">
@@ -532,9 +613,9 @@
           <div class="${bgClass} rounded-2xl p-4 text-sm max-w-[85%]">
             <div class="flex items-center space-x-2 mb-1">
               <span class="text-[10px] font-bold uppercase tracking-wider ${isCandidate ? 'text-indigo-200' : 'text-slate-400'}">${speaker}</span>
-              <span class="text-[9px] text-slate-500">${new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit', second: '2-digit'})}</span>
+              <span class="text-[9px] text-slate-500">${timeStr}</span>
             </div>
-            <div class="chat-text whitespace-pre-wrap leading-relaxed">${text}</div>
+            <div class="chat-text whitespace-pre-wrap leading-relaxed">${escapeHtml(text)}</div>
           </div>
           ${isCandidate ? `
             <div class="bg-indigo-600/10 border border-indigo-500/20 p-2 rounded-full w-8 h-8 flex items-center justify-center text-xs text-indigo-400">
@@ -548,14 +629,21 @@
       feed.scrollTop = feed.scrollHeight;
     }
 
-    let activeCandidateBubbleId = null;
+    // XSS protection
+    function escapeHtml(text) {
+      const div = document.createElement('div');
+      div.textContent = text;
+      return div.innerHTML;
+    }
 
     function appendTokenToActiveResponse(token) {
       const feed = document.getElementById("transcript-feed");
+      if (!feed) return;
       
       if (!activeCandidateBubbleId) {
         activeCandidateBubbleId = `candidate-bubble-${Date.now()}`;
-        const name = document.getElementById("bot-name").value || "Humail";
+        const botNameEl = document.getElementById("bot-name");
+        const name = (botNameEl && botNameEl.value) || "Humail";
         
         const card = `
           <div class="flex items-start space-x-3 justify-end" id="${activeCandidateBubbleId}">
@@ -593,7 +681,10 @@
     }
 
     function clearTranscript() {
-      document.getElementById("transcript-feed").innerHTML = `
+      const feed = document.getElementById("transcript-feed");
+      if (!feed) return;
+      
+      feed.innerHTML = `
         <div class="flex items-start space-x-3" id="empty-feed-placeholder">
           <div class="bg-slate-800 p-2 rounded-full text-slate-400 text-xs flex items-center justify-center w-8 h-8">
             <i class="fa-solid fa-trash-can"></i>
@@ -607,9 +698,16 @@
 
     // Start Agent Action
     async function startAgent() {
-      const meetUrl = document.getElementById("meet-url").value.trim();
-      const botName = document.getElementById("bot-name").value.trim();
-      const llmProvider = document.getElementById("llm-provider").value;
+      const meetUrlEl = document.getElementById("meet-url");
+      const botNameEl = document.getElementById("bot-name");
+      const llmProviderEl = document.getElementById("llm-provider");
+      const btnStart = document.getElementById("btn-start");
+      
+      if (!meetUrlEl || !btnStart) return;
+      
+      const meetUrl = meetUrlEl.value.trim();
+      const botName = botNameEl ? botNameEl.value.trim() : "Humail";
+      const llmProvider = llmProviderEl ? llmProviderEl.value : "gemini";
       
       if (!meetUrl) {
         alert("Please enter a valid Google Meet or Zoom URL before joining.");
@@ -618,8 +716,12 @@
       
       localStorage.setItem("last_meet_url", meetUrl);
 
-      document.getElementById("btn-start").disabled = true;
-      document.getElementById("btn-start").innerHTML = `<i class="fa-solid fa-circle-notch animate-spin"></i><span>Deploying Agent...</span>`;
+      btnStart.disabled = true;
+      btnStart.innerHTML = `<i class="fa-solid fa-circle-notch animate-spin"></i><span>Deploying Agent...</span>`;
+      
+      const candidateEdu = document.getElementById("candidate-edu");
+      const candidateExp = document.getElementById("candidate-exp");
+      const candidateSkills = document.getElementById("candidate-skills");
       
       const payload = {
         meeting_url: meetUrl,
@@ -627,9 +729,9 @@
         llm_provider: llmProvider,
         candidate_data: {
           name: botName,
-          education: document.getElementById("candidate-edu").value,
-          experience: document.getElementById("candidate-exp").value,
-          skills: document.getElementById("candidate-skills").value.split(",").map(s => s.trim())
+          education: candidateEdu ? candidateEdu.value : "",
+          experience: candidateExp ? candidateExp.value : "",
+          skills: candidateSkills ? candidateSkills.value.split(",").map(s => s.trim()).filter(s => s) : []
         }
       };
 
@@ -642,9 +744,15 @@
         
         const data = await resp.json();
         if (resp.ok) {
-          document.getElementById("btn-stop").disabled = false;
-          document.getElementById("display-bot-name").textContent = botName;
-          document.getElementById("connection-meta").textContent = `Deploying Video Avatar...`;
+          const btnStop = document.getElementById("btn-stop");
+          if (btnStop) btnStop.disabled = false;
+          
+          const displayBotName = document.getElementById("display-bot-name");
+          if (displayBotName) displayBotName.textContent = botName;
+          
+          const connectionMeta = document.getElementById("connection-meta");
+          if (connectionMeta) connectionMeta.textContent = `Deploying Video Avatar...`;
+          
           updateAvatarState("starting");
           startTimer();
         } else {
@@ -652,7 +760,7 @@
           resetControlUI();
         }
       } catch(e) {
-        console.error(e);
+        console.error("Start agent error:", e);
         alert("Error connecting to server. Is app.py running?");
         resetControlUI();
       }
@@ -660,8 +768,11 @@
 
     // Stop Agent Action
     async function stopAgent() {
-      document.getElementById("btn-stop").disabled = true;
-      document.getElementById("btn-stop").innerHTML = `<i class="fa-solid fa-circle-notch animate-spin"></i><span>Stopping Agent...</span>`;
+      const btnStop = document.getElementById("btn-stop");
+      if (!btnStop) return;
+      
+      btnStop.disabled = true;
+      btnStop.innerHTML = `<i class="fa-solid fa-circle-notch animate-spin"></i><span>Stopping Agent...</span>`;
 
       try {
         const resp = await fetch("/stop", { method: "POST" });
@@ -670,23 +781,34 @@
           updateAvatarState("stopped");
         } else {
           alert("Failed to stop session cleanly.");
-          document.getElementById("btn-stop").disabled = false;
-          document.getElementById("btn-stop").innerHTML = `<i class="fa-solid fa-circle-stop"></i><span>Stop Agent Session</span>`;
+          btnStop.disabled = false;
+          btnStop.innerHTML = `<i class="fa-solid fa-circle-stop"></i><span>Stop Agent Session</span>`;
         }
       } catch(e) {
-        console.error(e);
+        console.error("Stop agent error:", e);
         resetControlUI();
       }
     }
 
     function resetControlUI() {
-      document.getElementById("btn-start").disabled = false;
-      document.getElementById("btn-start").innerHTML = `<i class="fa-solid fa-bolt"></i><span>Initialize &amp; Join Meeting</span>`;
+      const btnStart = document.getElementById("btn-start");
+      const btnStop = document.getElementById("btn-stop");
+      const connectionMeta = document.getElementById("connection-meta");
       
-      document.getElementById("btn-stop").disabled = true;
-      document.getElementById("btn-stop").innerHTML = `<i class="fa-solid fa-circle-stop"></i><span>Stop Agent Session</span>`;
+      if (btnStart) {
+        btnStart.disabled = false;
+        btnStart.innerHTML = `<i class="fa-solid fa-bolt"></i><span>Initialize &amp; Join Meeting</span>`;
+      }
       
-      document.getElementById("connection-meta").textContent = "Offline — Session Inactive";
+      if (btnStop) {
+        btnStop.disabled = true;
+        btnStop.innerHTML = `<i class="fa-solid fa-circle-stop"></i><span>Stop Agent Session</span>`;
+      }
+      
+      if (connectionMeta) {
+        connectionMeta.textContent = "Offline — Session Inactive";
+      }
+      
       stopTimer();
     }
 
@@ -696,60 +818,78 @@
       const label = document.getElementById("state-label");
       const dot = document.getElementById("state-dot");
       const ping = document.getElementById("state-ping");
+      const connectionMeta = document.getElementById("connection-meta");
+      
+      if (!ring || !label || !dot || !ping) return;
       
       // Reset previous classes
       ring.className = "w-38 h-38 rounded-full border-4 border-slate-850 flex items-center justify-center transition-all duration-300";
       dot.className = "relative inline-flex rounded-full h-2 w-2";
       ping.className = "animate-ping absolute inline-flex h-full w-full rounded-full opacity-75";
       
-      label.textContent = state.replace(/_/g, ' ');
+      const cleanState = state ? state.replace(/_/g, ' ') : 'unknown';
+      label.textContent = cleanState;
 
       if (state === "listening") {
         ring.classList.add("glow-listening");
         dot.classList.add("bg-blue-500");
         ping.classList.add("bg-blue-400");
-        document.getElementById("connection-meta").textContent = "Candidate: Actively Listening";
+        if (connectionMeta) connectionMeta.textContent = "Candidate: Actively Listening";
       }
       else if (state === "thinking") {
         ring.classList.add("glow-thinking");
         dot.classList.add("bg-purple-500");
         ping.classList.add("bg-purple-400");
-        document.getElementById("connection-meta").textContent = "Candidate: Formulating Response";
+        if (connectionMeta) connectionMeta.textContent = "Candidate: Formulating Response";
       }
       else if (state === "speaking") {
         ring.classList.add("glow-speaking");
         dot.classList.add("bg-emerald-500");
         ping.classList.add("bg-emerald-400");
-        document.getElementById("connection-meta").textContent = "Candidate: Speaking (Cloned Voice)";
+        if (connectionMeta) connectionMeta.textContent = "Candidate: Speaking (Cloned Voice)";
       }
       else if (state === "starting") {
         ring.classList.add("border-indigo-500/60 animate-pulse");
         dot.classList.add("bg-indigo-500");
         ping.classList.add("bg-indigo-400");
       }
-      else if (state === "stopped" || state === "idle") {
+      else if (state === "stopped" || state === "idle" || !state) {
         ring.classList.add("border-slate-800");
         dot.classList.add("bg-slate-600");
         ping.classList.add("bg-slate-500");
         label.textContent = "offline";
+        if (connectionMeta) connectionMeta.textContent = "Offline — Session Inactive";
       }
     }
 
     function startTimer() {
+      // CRITICAL FIX: Clear existing timer first to prevent multiple timers (Fixes UI Issue #4)
+      stopTimer();
+      
       secondsElapsed = 0;
-      clearInterval(timerInterval);
+      const runtimeEl = document.getElementById("agent-runtime");
+      
       timerInterval = setInterval(() => {
         secondsElapsed++;
         const hrs = String(Math.floor(secondsElapsed / 3600)).padStart(2, '0');
         const mins = String(Math.floor((secondsElapsed % 3600) / 60)).padStart(2, '0');
         const secs = String(secondsElapsed % 60).padStart(2, '0');
-        document.getElementById("agent-runtime").textContent = `${hrs}:${mins}:${secs}`;
+        if (runtimeEl) {
+          runtimeEl.textContent = `${hrs}:${mins}:${secs}`;
+        }
       }, 1000);
     }
 
     function stopTimer() {
-      clearInterval(timerInterval);
-      document.getElementById("agent-runtime").textContent = "00:00:00";
+      if (timerInterval) {
+        clearInterval(timerInterval);
+        timerInterval = null;
+      }
+      secondsElapsed = 0;
+      const runtimeEl = document.getElementById("agent-runtime");
+      if (runtimeEl) {
+        runtimeEl.textContent = "00:00:00";
+      }
     }
   </script>
 </body>

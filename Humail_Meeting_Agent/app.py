@@ -1,14 +1,17 @@
 import asyncio
 import logging
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, BackgroundTasks, UploadFile, File
-from fastapi.responses import HTMLResponse, FileResponse
+from typing import Dict, List, Optional, Set
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, BackgroundTasks, UploadFile, File, Request
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from pydantic import BaseModel
 import uvicorn
+import json
 
 import config
 from agent.orchestrator import InterviewAgentOrchestrator
@@ -19,10 +22,95 @@ logging.basicConfig(
 )
 logger = logging.getLogger("API-Server")
 
+# ==============================================================================
+# ROBUST WEBSOCKET MANAGER - Fixes CRITICAL-1 (Memory Leak & Race Condition)
+# ==============================================================================
+class RobustWebSocketManager:
+    """Thread-safe WebSocket manager with stale connection cleanup"""
+    def __init__(self):
+        self.active_connections: Dict[str, Set[WebSocket]] = {}
+        self._lock = asyncio.Lock()
+
+    async def connect(self, session_id: str, websocket: WebSocket):
+        await websocket.accept()
+        async with self._lock:
+            if session_id not in self.active_connections:
+                self.active_connections[session_id] = set()
+            self.active_connections[session_id].add(websocket)
+        logger.info(f"WebSocket client connected to session: {session_id}")
+
+    def disconnect(self, session_id: str, websocket: WebSocket):
+        """Safe removal without iteration issues"""
+        try:
+            if session_id in self.active_connections:
+                self.active_connections[session_id].discard(websocket)
+                if not self.active_connections[session_id]:
+                    del self.active_connections[session_id]
+            logger.info(f"WebSocket client disconnected from session: {session_id}")
+        except Exception as e:
+            logger.error(f"Error during websocket disconnect cleanup: {e}")
+
+    async def broadcast(self, session_id: str, message: dict):
+        """Broadcasts with automatic stale connection cleanup"""
+        targets = []
+        stale_connections = []
+        
+        async with self._lock:
+            # Copy to list to avoid modification during iteration
+            session_targets = list(self.active_connections.get(session_id, []))
+            all_targets = list(self.active_connections.get("active", [])) + list(self.active_connections.get("all", []))
+            targets = list(set(session_targets + all_targets))  # Deduplicate
+        
+        for ws in targets:
+            try:
+                await ws.send_json(message)
+            except Exception as e:
+                logger.warning(f"Failed to send to WebSocket, marking for cleanup: {e}")
+                stale_connections.append((session_id, ws))
+        
+        # Cleanup stale connections AFTER iteration completes
+        if stale_connections:
+            async with self._lock:
+                for sid, ws in stale_connections:
+                    if sid in self.active_connections:
+                        self.active_connections[sid].discard(ws)
+                        if not self.active_connections[sid]:
+                            del self.active_connections[sid]
+
+manager = RobustWebSocketManager()
+
+# ==============================================================================
+# INPUT VALIDATION HELPERS
+# ==============================================================================
+def validate_meeting_url(url: str) -> bool:
+    """Validates Google Meet or Zoom URL format"""
+    if not url or not isinstance(url, str):
+        return False
+    pattern = r'^https?://(meet\.google\.com/[a-z-]+|zoom\.us/j/\d+|.*\.zoom\.us/.*)'
+    return bool(re.match(pattern, url, re.IGNORECASE))
+
+# ==============================================================================
+# FASTAPI APP WITH LIFESPAN MANAGEMENT
+# ==============================================================================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Graceful startup and shutdown handling"""
+    logger.info("🚀 Humail Agent Starting...")
+    yield
+    logger.info("🛑 Shutting down Humail Agent...")
+    # Ensure all orchestrators are stopped on shutdown
+    if state.orchestrator_task and not state.orchestrator_task.done():
+        state.orchestrator_task.cancel()
+        try:
+            await state.orchestrator_task
+        except asyncio.CancelledError:
+            pass
+
 app = FastAPI(
     title="Autonomous AI Interview Agent API",
     description="REST & WebSocket API to coordinate and track the AI Interview Candidate Agent.",
-    version="1.5.0"
+    version="1.5.0",
+    lifespan=lifespan
 )
 
 # In-memory storage for active sessions and orchestrator tasks
@@ -34,41 +122,6 @@ class AppState:
     bot_name: Optional[str] = None
 
 state = AppState()
-
-# WebSocket Connection Manager
-class ConnectionManager:
-    def __init__(self):
-        # Maps session_id (or "all") to list of active WebSockets
-        self.active_connections: Dict[str, List[WebSocket]] = {}
-
-    async def connect(self, session_id: str, websocket: WebSocket):
-        await websocket.accept()
-        if session_id not in self.active_connections:
-            self.active_connections[session_id] = []
-        self.active_connections[session_id].append(websocket)
-        logger.info(f"WebSocket client connected to session: {session_id}")
-
-    def disconnect(self, session_id: str, websocket: WebSocket):
-        if session_id in self.active_connections:
-            if websocket in self.active_connections[session_id]:
-                self.active_connections[session_id].remove(websocket)
-            if not self.active_connections[session_id]:
-                del self.active_connections[session_id]
-        logger.info(f"WebSocket client disconnected from session: {session_id}")
-
-    async def broadcast(self, session_id: str, message: dict):
-        """Broadcasts JSON updates to all websocket listeners of a session."""
-        targets = self.active_connections.get(session_id, [])
-        all_targets = self.active_connections.get("active", []) + self.active_connections.get("all", [])
-        
-        for ws in targets + all_targets:
-            try:
-                await ws.send_json(message)
-            except Exception as e:
-                # Stale connection cleanup
-                logger.debug(f"Failed to send to WebSocket, skipping: {e}")
-
-manager = ConnectionManager()
 
 # Pydantic request models
 class StartAgentRequest(BaseModel):
@@ -98,19 +151,28 @@ async def run_orchestrator_background(orchestrator: InterviewAgentOrchestrator):
             
             # 2. Transition state to 'thinking'
             await manager.broadcast(session_id, {"event": "state_change", "state": "thinking"})
-            await orchestrator.session["client"].send_command({"type": "voice.state_update", "state": "thinking"})
+            if orchestrator.session and "client" in orchestrator.session:
+                try:
+                    await orchestrator.session["client"].send_command({"type": "voice.state_update", "state": "thinking"})
+                except Exception as e:
+                    logger.warning(f"Failed to send voice state update: {e}")
             
             # 3. Generate answer and stream tokens to WebSocket
             response_text = ""
-            async for chunk in orchestrator.brain.generate_answer(question):
-                response_text += chunk
-                sys.stdout.write(chunk)
-                sys.stdout.flush()
-                # Broadcast real-time token
-                await manager.broadcast(session_id, {
-                    "event": "brain_stream_token",
-                    "text": chunk
-                })
+            try:
+                async for chunk in orchestrator.brain.generate_answer(question):
+                    response_text += chunk
+                    sys.stdout.write(chunk)
+                    sys.stdout.flush()
+                    # Broadcast real-time token
+                    await manager.broadcast(session_id, {
+                        "event": "brain_stream_token",
+                        "text": chunk
+                    })
+            except Exception as e:
+                logger.error(f"Error generating answer: {e}")
+                response_text = "I apologize, but I'm experiencing technical difficulties."
+            
             sys.stdout.write("\n")
             
             # 4. Finalize brain generation and transition to 'speaking'
@@ -121,8 +183,11 @@ async def run_orchestrator_background(orchestrator: InterviewAgentOrchestrator):
             await manager.broadcast(session_id, {"event": "state_change", "state": "speaking"})
             
             # 5. Play cloned voice into meeting
-            if response_text.strip():
-                await orchestrator.cloner.speak(orchestrator.session["client"], response_text)
+            if response_text.strip() and orchestrator.session and "client" in orchestrator.session:
+                try:
+                    await orchestrator.cloner.speak(orchestrator.session["client"], response_text)
+                except Exception as e:
+                    logger.error(f"Failed to speak response: {e}")
                 
             # 6. Reset state to 'listening'
             await manager.broadcast(session_id, {"event": "state_change", "state": "listening"})
@@ -131,8 +196,11 @@ async def run_orchestrator_background(orchestrator: InterviewAgentOrchestrator):
         
         # Start the orchestrator
         await orchestrator.start()
+    except asyncio.CancelledError:
+        logger.info("Orchestrator task cancelled")
+        raise
     except Exception as e:
-        logger.error(f"Error in background orchestrator task: {e}")
+        logger.exception(f"Error in background orchestrator task: {e}")
     finally:
         state.current_status = "idle"
         state.orchestrator = None

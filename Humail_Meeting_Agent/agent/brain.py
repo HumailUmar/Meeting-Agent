@@ -120,12 +120,12 @@ class AIBrain:
             
             full_response = ""
             try:
-                async with aiohttp.ClientSession() as session:
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
                     async with session.post(url, json=payload) as resp:
                         if resp.status != 200:
                             err_msg = await resp.text()
                             logger.error(f"Gemini API error ({resp.status}): {err_msg}")
-                            raise RuntimeError("Gemini API error")
+                            raise RuntimeError(f"Gemini API error: {resp.status}")
                             
                         # Parse the JSON streaming response
                         async for line in resp.content:
@@ -144,16 +144,40 @@ class AIBrain:
                                 
                             try:
                                 chunk_json = json.loads(line_str)
-                                part_text = chunk_json["candidates"][0]["content"]["parts"][0]["text"]
+                                # CRITICAL FIX: Safe nested access with validation (Fixes CRITICAL-4)
+                                candidates = chunk_json.get("candidates", [])
+                                if not candidates or not isinstance(candidates, list):
+                                    logger.warning(f"Invalid Gemini response structure: missing candidates")
+                                    continue
+                                    
+                                content = candidates[0].get("content", {}) if len(candidates) > 0 else {}
+                                if not isinstance(content, dict):
+                                    continue
+                                    
+                                parts = content.get("parts", [])
+                                if not parts or not isinstance(parts, list):
+                                    continue
+                                    
+                                part_text = parts[0].get("text", "") if len(parts) > 0 and isinstance(parts[0], dict) else ""
                                 if part_text:
                                     full_response += part_text
                                     yield part_text
-                            except Exception:
-                                pass
+                            except json.JSONDecodeError as e:
+                                logger.warning(f"Gemini JSON parse error: {e}")
+                                continue
+                            except (KeyError, IndexError, TypeError) as e:
+                                logger.warning(f"Gemini response structure error: {e}")
+                                continue
                                 
-                self.history.append({"role": "model", "parts": [{"text": full_response}]})
+                if full_response:
+                    self.history.append({"role": "model", "parts": [{"text": full_response}]})
+            except asyncio.TimeoutError:
+                logger.error("Gemini API request timed out")
+                fallback = "I apologize, but my connection seems to be running slowly. Could you please repeat that?"
+                yield fallback
+                self.history.append({"role": "model", "parts": [{"text": fallback}]})
             except Exception as e:
-                logger.error(f"Gemini API connection error: {e}")
+                logger.exception(f"Gemini API connection error: {e}")
                 fallback = "Actually, there is a minor network interruption on my end. But going back to your question, I believe my skills are highly aligned."
                 yield fallback
                 self.history.append({"role": "model", "parts": [{"text": fallback}]})
