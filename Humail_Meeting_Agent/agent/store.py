@@ -8,6 +8,7 @@ import config
 
 DB_PATH = Path(__file__).resolve().parent.parent / "sessions.db"
 
+
 class SQLiteStateStore:
     """
     SaaS Production-Grade State Store backed by SQLite.
@@ -17,8 +18,12 @@ class SQLiteStateStore:
         self._init_db()
 
     def _get_conn(self):
-        conn = sqlite3.connect(str(DB_PATH))
+        # check_same_thread=False: the store is used across the FastAPI event loop.
+        # WAL mode + a short busy timeout reduces "database is locked" contention.
+        conn = sqlite3.connect(str(DB_PATH), check_same_thread=False, timeout=30.0)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=30000")
         return conn
 
     def _init_db(self):
@@ -54,6 +59,10 @@ class SQLiteStateStore:
                 INSERT INTO sessions (session_id, meeting_url, bot_name, status, avatar_path, voice_path, call_id, pika_session_id)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(session_id) DO UPDATE SET
+                    meeting_url=excluded.meeting_url,
+                    bot_name=excluded.bot_name,
+                    avatar_path=excluded.avatar_path,
+                    voice_path=excluded.voice_path,
                     status=excluded.status,
                     call_id=COALESCE(excluded.call_id, sessions.call_id),
                     pika_session_id=COALESCE(excluded.pika_session_id, sessions.pika_session_id)

@@ -484,7 +484,9 @@
         try {
           const msg = JSON.parse(event.data);
           handleWebSocketMessage(msg);
-        } catch(e) {}
+        } catch(e) {
+          console.warn("WebSocket message was not valid JSON; skipping:", event.data);
+        }
       };
     }
 
@@ -502,6 +504,11 @@
       else if (msg.event === "brain_stream_token") {
         document.getElementById("typing-indicator").classList.remove("hidden");
         appendTokenToActiveResponse(msg.text);
+        // Safety: auto-hide the thinking indicator if no finalize arrives in 30s.
+        if (typingSafetyTimer) clearTimeout(typingSafetyTimer);
+        typingSafetyTimer = setTimeout(() => {
+          document.getElementById("typing-indicator").classList.add("hidden");
+        }, 30000);
       }
       else if (msg.event === "brain_response_done") {
         document.getElementById("typing-indicator").classList.add("hidden");
@@ -509,46 +516,65 @@
       }
     }
 
-    // Append Bubble
+    // Append Bubble (XSS-safe: text is set via textContent, never innerHTML)
     function appendChatBubble(speaker, text) {
       const feed = document.getElementById("transcript-feed");
-      const bubbleId = `bubble-${Date.now()}`;
-      
+      const bubbleId = `bubble-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+
       const isCandidate = speaker.toLowerCase() !== "interviewer";
       const alignClass = isCandidate ? "justify-end" : "justify-start";
       const bgClass = isCandidate 
         ? "bg-indigo-600/90 text-white rounded-tr-none border border-indigo-500/20 shadow-md shadow-indigo-600/5" 
         : "bg-slate-900 text-slate-100 rounded-tl-none border border-slate-800/80";
-        
+      
       const icon = isCandidate ? "fa-user-tie text-indigo-400" : "fa-microphone text-slate-400";
-      
-      const card = `
-        <div class="flex items-start space-x-3 ${alignClass}" id="${bubbleId}">
-          ${!isCandidate ? `
-            <div class="bg-slate-800 p-2 rounded-full w-8 h-8 flex items-center justify-center text-xs text-slate-300 shadow-inner">
-              <i class="fa-solid ${icon}"></i>
-            </div>
-          ` : ''}
-          <div class="${bgClass} rounded-2xl p-4 text-sm max-w-[85%]">
-            <div class="flex items-center space-x-2 mb-1">
-              <span class="text-[10px] font-bold uppercase tracking-wider ${isCandidate ? 'text-indigo-200' : 'text-slate-400'}">${speaker}</span>
-              <span class="text-[9px] text-slate-500">${new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit', second: '2-digit'})}</span>
-            </div>
-            <div class="chat-text whitespace-pre-wrap leading-relaxed">${text}</div>
-          </div>
-          ${isCandidate ? `
-            <div class="bg-indigo-600/10 border border-indigo-500/20 p-2 rounded-full w-8 h-8 flex items-center justify-center text-xs text-indigo-400">
-              <i class="fa-solid ${icon}"></i>
-            </div>
-          ` : ''}
-        </div>
-      `;
-      
-      feed.insertAdjacentHTML("beforeend", card);
+
+      const wrapper = document.createElement("div");
+      wrapper.className = `flex items-start space-x-3 ${alignClass}`;
+      wrapper.id = bubbleId;
+
+      if (!isCandidate) {
+        const ic = document.createElement("div");
+        ic.className = "bg-slate-800 p-2 rounded-full w-8 h-8 flex items-center justify-center text-xs text-slate-300 shadow-inner";
+        ic.innerHTML = `<i class="fa-solid ${icon}"></i>`;
+        wrapper.appendChild(ic);
+      }
+
+      const card = document.createElement("div");
+      card.className = `${bgClass} rounded-2xl p-4 text-sm max-w-[85%]`;
+
+      const header = document.createElement("div");
+      header.className = "flex items-center space-x-2 mb-1";
+      const nameSpan = document.createElement("span");
+      nameSpan.className = `text-[10px] font-bold uppercase tracking-wider ${isCandidate ? 'text-indigo-200' : 'text-slate-400'}`;
+      nameSpan.textContent = speaker;
+      const timeSpan = document.createElement("span");
+      timeSpan.className = "text-[9px] text-slate-500";
+      timeSpan.textContent = new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit', second: '2-digit'});
+      header.appendChild(nameSpan);
+      header.appendChild(timeSpan);
+
+      const body = document.createElement("div");
+      body.className = "chat-text whitespace-pre-wrap leading-relaxed";
+      body.textContent = text;  // safe — no HTML injection
+
+      card.appendChild(header);
+      card.appendChild(body);
+      wrapper.appendChild(card);
+
+      if (isCandidate) {
+        const ic = document.createElement("div");
+        ic.className = "bg-indigo-600/10 border border-indigo-500/20 p-2 rounded-full w-8 h-8 flex items-center justify-center text-xs text-indigo-400";
+        ic.innerHTML = `<i class="fa-solid ${icon}"></i>`;
+        wrapper.appendChild(ic);
+      }
+
+      feed.insertAdjacentElement("beforeend", wrapper);
       feed.scrollTop = feed.scrollHeight;
     }
 
     let activeCandidateBubbleId = null;
+    let typingSafetyTimer = null;
 
     function appendTokenToActiveResponse(token) {
       const feed = document.getElementById("transcript-feed");
@@ -557,21 +583,38 @@
         activeCandidateBubbleId = `candidate-bubble-${Date.now()}`;
         const name = document.getElementById("bot-name").value || "Humail";
         
-        const card = `
-          <div class="flex items-start space-x-3 justify-end" id="${activeCandidateBubbleId}">
-            <div class="bg-indigo-600/90 text-white rounded-2xl rounded-tr-none border border-indigo-500/20 p-4 text-sm max-w-[85%] shadow-md">
-              <div class="flex items-center space-x-2 mb-1">
-                <span class="text-[10px] font-bold uppercase tracking-wider text-indigo-200">${name}</span>
-                <span class="text-[9px] text-slate-400">Thinking...</span>
-              </div>
-              <div class="chat-text whitespace-pre-wrap leading-relaxed animate-pulse" id="${activeCandidateBubbleId}-text"></div>
-            </div>
-            <div class="bg-indigo-600/10 border border-indigo-500/20 p-2 rounded-full w-8 h-8 flex items-center justify-center text-xs text-indigo-400">
-              <i class="fa-solid fa-user-tie"></i>
-            </div>
-          </div>
-        `;
-        feed.insertAdjacentHTML("beforeend", card);
+        const wrapper = document.createElement("div");
+        wrapper.className = "flex items-start space-x-3 justify-end";
+        wrapper.id = activeCandidateBubbleId;
+
+        const card = document.createElement("div");
+        card.className = "bg-indigo-600/90 text-white rounded-2xl rounded-tr-none border border-indigo-500/20 p-4 text-sm max-w-[85%] shadow-md";
+
+        const header = document.createElement("div");
+        header.className = "flex items-center space-x-2 mb-1";
+        const nameSpan = document.createElement("span");
+        nameSpan.className = "text-[10px] font-bold uppercase tracking-wider text-indigo-200";
+        nameSpan.textContent = name;
+        const think = document.createElement("span");
+        think.className = "text-[9px] text-slate-400";
+        think.textContent = "Thinking...";
+        header.appendChild(nameSpan);
+        header.appendChild(think);
+
+        const body = document.createElement("div");
+        body.className = "chat-text whitespace-pre-wrap leading-relaxed animate-pulse";
+        body.id = `${activeCandidateBubbleId}-text`;
+
+        card.appendChild(header);
+        card.appendChild(body);
+
+        const ic = document.createElement("div");
+        ic.className = "bg-indigo-600/10 border border-indigo-500/20 p-2 rounded-full w-8 h-8 flex items-center justify-center text-xs text-indigo-400";
+        ic.innerHTML = `<i class="fa-solid fa-user-tie"></i>`;
+
+        wrapper.appendChild(card);
+        wrapper.appendChild(ic);
+        feed.insertAdjacentElement("beforeend", wrapper);
       }
       
       const textNode = document.getElementById(`${activeCandidateBubbleId}-text`);
@@ -589,6 +632,12 @@
           textNode.classList.remove("animate-pulse");
         }
         activeCandidateBubbleId = null;
+      }
+      // Always clear the typing indicator (guards against missed brain_response_done).
+      document.getElementById("typing-indicator").classList.add("hidden");
+      if (typingSafetyTimer) {
+        clearTimeout(typingSafetyTimer);
+        typingSafetyTimer = null;
       }
     }
 

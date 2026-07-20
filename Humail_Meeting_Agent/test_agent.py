@@ -70,9 +70,9 @@ class TestAIInterviewAgent(unittest.IsolatedAsyncioTestCase):
         print("\n[TEST] Verifying AI Brain (Answer Generation)...")
         brain = AIBrain(provider="ollama", model="llama3")
 
-        # Confirm Persona contains candidate name and speaking style constraints
+        # Confirm persona/system prompt sets the in-character rule (negation of 'As an AI').
+        self.assertIn("Never say", brain.history[0]["content"])
         self.assertIn("Humail Umar", brain.persona)
-        self.assertIn("As an AI", brain.history[0]["content"])
 
         # Mock the Ollama Async client to test answer streaming
         mock_chunk_1 = {"message": {"content": "Well, "}}
@@ -83,9 +83,17 @@ class TestAIInterviewAgent(unittest.IsolatedAsyncioTestCase):
             for chunk in [mock_chunk_1, mock_chunk_2, mock_chunk_3]:
                 yield chunk
 
+        # Ensure the `ollama` module exists so it can be patched even if the
+        # optional dependency isn't installed in the test environment.
+        import types
+        if "ollama" not in sys.modules:
+            mod = types.ModuleType("ollama")
+            mod.AsyncClient = object  # placeholder; patch() overrides it
+            sys.modules["ollama"] = mod
+
         with patch("ollama.AsyncClient") as mock_ollama_client:
             mock_client_instance = mock_ollama_client.return_value
-            mock_client_instance.chat = AsyncMock(return_value=mock_chat_generator())
+            mock_client_instance.chat = mock_chat_generator
 
             generated_tokens = []
             async for token in brain.generate_answer("Tell me about your skills."):
@@ -96,7 +104,7 @@ class TestAIInterviewAgent(unittest.IsolatedAsyncioTestCase):
             # Check conversation history update
             self.assertEqual(brain.history[-1]["role"], "assistant")
             self.assertEqual(brain.history[-1]["content"], full_response)
-            
+
         print("[SUCCESS] Brain Persona rules and token streaming generation verified!")
 
     def test_audio_transcription_connect(self):
@@ -158,6 +166,11 @@ class TestAIInterviewAgent(unittest.IsolatedAsyncioTestCase):
             b'' # EOF
         ])
         mock_process.stderr.read = AsyncMock(return_value=b'')
+        # Subprocess terminate/kill/wait are sync in real code; use plain mocks
+        # to avoid unawaited-coroutine ResourceWarnings under AsyncMock.
+        mock_process.terminate = MagicMock()
+        mock_process.kill = MagicMock()
+        mock_process.wait = MagicMock(return_value=0)
         mock_subprocess_exec.return_value = mock_process
 
         # Patch os.path.exists to return True so it doesn't fail on missing placeholder avatar image

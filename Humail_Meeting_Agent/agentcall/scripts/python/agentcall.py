@@ -11,6 +11,9 @@ import websockets
 
 CONFIG_PATH = Path.home() / ".agentcall" / "config.json"
 
+# Default network timeout for all HTTP calls (seconds).
+DEFAULT_TIMEOUT = aiohttp.ClientTimeout(total=float(os.getenv("AGENTCALL_HTTP_TIMEOUT", "30")))
+
 
 def load_api_key() -> str:
     """Load API key: env var first, then ~/.agentcall/config.json."""
@@ -47,17 +50,20 @@ class AgentCallClient:
         self.api_key = api_key or load_api_key()
         self.base_url = base_url or load_api_url() or "https://api.agentcall.dev"
         self._session: Optional[aiohttp.ClientSession] = None
+        self._ws = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
-                headers={"Authorization": f"Bearer {self.api_key}"}
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                timeout=DEFAULT_TIMEOUT,
             )
         return self._session
 
     async def close(self):
         if self._session and not self._session.closed:
             await self._session.close()
+        self._session = None
 
     # --- Call Management ---
 
@@ -66,7 +72,10 @@ class AgentCallClient:
         session = await self._get_session()
         async with session.post(f"{self.base_url}/v1/calls", json=kwargs) as resp:
             resp.raise_for_status()
-            return await resp.json()
+            data = await resp.json()
+            if not isinstance(data, dict):
+                raise ValueError(f"create_call returned unexpected payload: {type(data)}")
+            return data
 
     async def get_call(self, call_id: str) -> dict:
         """Get call details."""
@@ -109,25 +118,36 @@ class AgentCallClient:
         async with websockets.connect(uri) as ws:
             self._ws = ws
             async for message in ws:
-                event = json.loads(message)
-                yield event
+                try:
+                    event = json.loads(message)
+                except (json.JSONDecodeError, TypeError):
+                    # Skip malformed frames instead of killing the consumer.
+                    continue
+                if isinstance(event, dict):
+                    yield event
 
     async def send_command(self, command: dict):
-        """Send a command via the WebSocket with automatic retry on transient errors.
-        Retries up to 3 times with exponential backoff (for WS reconnect windows)."""
+        """
+        Send a command via the WebSocket with automatic retry on transient errors.
+        Retries up to 3 times with exponential backoff. Returns True on success,
+        raises RuntimeError after persistent failure so callers can react.
+        """
         import sys
+        last_err = None
         for attempt in range(3):
             try:
                 if hasattr(self, "_ws") and self._ws:
                     await self._ws.send(json.dumps(command))
                     return True
             except Exception as e:
+                last_err = e
                 print(f"[agentcall] send failed (attempt {attempt + 1}/3): {e}",
                       file=sys.stderr, flush=True)
                 await asyncio.sleep(0.5 * (attempt + 1))
-        print(f"[agentcall] dropped command after 3 failures: {command.get('type', '?')}",
-              file=sys.stderr, flush=True)
-        return False
+        err = last_err or RuntimeError("WebSocket not connected")
+        raise RuntimeError(
+            f"[agentcall] dropped command after 3 failures: {command.get('type', '?')} ({err})"
+        )
 
     # --- TTS ---
 

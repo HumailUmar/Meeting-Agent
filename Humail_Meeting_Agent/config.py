@@ -13,7 +13,10 @@ OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 # Paths
 BASE_DIR = Path(__file__).resolve().parent
 AVATAR_IMAGE_PATH = os.getenv("AVATAR_IMAGE_PATH", str(BASE_DIR / "identity" / "videomeeting-avatar.png"))
-VOICE_SAMPLE_PATH = os.getenv("VOICE_SAMPLE_PATH", str(BASE_DIR / "life" / "voice_sample.wav"))
+
+# The reference voice sample lives under identity/ (which exists) by default.
+# Previously pointed at a non-existent `life/` directory, so the clone always failed.
+VOICE_SAMPLE_PATH = os.getenv("VOICE_SAMPLE_PATH", str(BASE_DIR / "identity" / "voice_sample.wav"))
 
 # Toggle to load the heavy CPU/GPU Coqui XTTS v2 neural model. 
 # Set to 'false' in low-RAM/CPU-only production servers to prevent OOM risks.

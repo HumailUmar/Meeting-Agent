@@ -4,6 +4,7 @@ import os
 import shutil
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
 from typing import Dict, List, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, BackgroundTasks, UploadFile, File
 from fastapi.responses import HTMLResponse, FileResponse
@@ -12,6 +13,10 @@ import uvicorn
 
 import config
 from agent.orchestrator import InterviewAgentOrchestrator
+from agent.store import get_state_store
+
+# Persistent session store (SQLite by default, Memory for tests).
+state_store = get_state_store()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -98,19 +103,27 @@ async def run_orchestrator_background(orchestrator: InterviewAgentOrchestrator):
             
             # 2. Transition state to 'thinking'
             await manager.broadcast(session_id, {"event": "state_change", "state": "thinking"})
-            await orchestrator.session["client"].send_command({"type": "voice.state_update", "state": "thinking"})
+            client = orchestrator.session.get("client") if isinstance(orchestrator.session, dict) else None
+            if client is not None:
+                await client.send_command({"type": "voice.state_update", "state": "thinking"})
+            else:
+                logger.warning("Hooked process_question: client unavailable; skipping voice command.")
             
             # 3. Generate answer and stream tokens to WebSocket
             response_text = ""
-            async for chunk in orchestrator.brain.generate_answer(question):
-                response_text += chunk
-                sys.stdout.write(chunk)
-                sys.stdout.flush()
-                # Broadcast real-time token
-                await manager.broadcast(session_id, {
-                    "event": "brain_stream_token",
-                    "text": chunk
-                })
+            try:
+                async for chunk in orchestrator.brain.generate_answer(question):
+                    response_text += chunk
+                    sys.stdout.write(chunk)
+                    sys.stdout.flush()
+                    # Broadcast real-time token
+                    await manager.broadcast(session_id, {
+                        "event": "brain_stream_token",
+                        "text": chunk
+                    })
+            except Exception as e:
+                logger.error(f"Error during hooked answer generation: {e}")
+                response_text = response_text or "Sorry, I had a small hiccup there."
             sys.stdout.write("\n")
             
             # 4. Finalize brain generation and transition to 'speaking'
@@ -121,8 +134,8 @@ async def run_orchestrator_background(orchestrator: InterviewAgentOrchestrator):
             await manager.broadcast(session_id, {"event": "state_change", "state": "speaking"})
             
             # 5. Play cloned voice into meeting
-            if response_text.strip():
-                await orchestrator.cloner.speak(orchestrator.session["client"], response_text)
+            if response_text.strip() and client is not None:
+                await orchestrator.cloner.speak(client, response_text)
                 
             # 6. Reset state to 'listening'
             await manager.broadcast(session_id, {"event": "state_change", "state": "listening"})
@@ -155,41 +168,89 @@ async def serve_avatar():
         return FileResponse(img_path)
     return FileResponse(Path(__file__).resolve().parent / "Pika-Skills" / "pikastream-video-meeting" / "assets" / "placeholder-avatar.jpg")
 
-# Picture Upload Endpoint
+# Upload safety limits
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(15 * 1024 * 1024)))  # 15 MB
+ALLOWED_AVATAR_EXT = {".png", ".jpg", ".jpeg"}
+ALLOWED_VOICE_EXT = {".wav", ".mp3", ".m4a", ".ogg", ".flac"}
+
+
+def _safe_filename(filename: Optional[str]) -> Optional[str]:
+    """Return a normalized lower-case extension, or None if the filename is unsafe."""
+    if not filename:
+        return None
+    ext = os.path.splitext(filename)[1].lower()
+    return ext
+
+
 @app.post("/upload/avatar", summary="Upload a custom avatar image")
 async def upload_avatar(file: UploadFile = File(...)):
-    # Validate extension
-    ext = os.path.splitext(file.filename)[1].lower()
-    if ext not in [".png", ".jpg", ".jpeg"]:
+    # Validate filename / extension
+    ext = _safe_filename(file.filename)
+    if ext is None:
+        raise HTTPException(status_code=400, detail="Missing filename.")
+    if ext not in ALLOWED_AVATAR_EXT:
         raise HTTPException(status_code=400, detail="Only PNG, JPG, or JPEG images are supported.")
-    
-    # Ensure directory exists
+
+    # Ensure directory exists (create parent dirs)
     os.makedirs(os.path.dirname(config.AVATAR_IMAGE_PATH), exist_ok=True)
-    
+
     try:
+        # Stream with a size cap to prevent disk exhaustion.
+        written = 0
         with open(config.AVATAR_IMAGE_PATH, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+            while True:
+                chunk = await file.read(1024 * 64)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > MAX_UPLOAD_BYTES:
+                    buffer.close()
+                    try:
+                        os.remove(config.AVATAR_IMAGE_PATH)
+                    except OSError:
+                        pass
+                    raise HTTPException(status_code=413, detail="File too large.")
+                buffer.write(chunk)
         logger.info(f"Custom avatar image uploaded successfully: {config.AVATAR_IMAGE_PATH}")
         return {"status": "success", "file_path": config.AVATAR_IMAGE_PATH}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save avatar image: {e}")
 
-# Audio Upload Endpoint
+
 @app.post("/upload/voice", summary="Upload a reference voice sample for cloning")
 async def upload_voice(file: UploadFile = File(...)):
-    # Validate extension
-    ext = os.path.splitext(file.filename)[1].lower()
-    if ext not in [".wav", ".mp3", ".m4a", ".ogg", ".flac"]:
+    # Validate filename / extension
+    ext = _safe_filename(file.filename)
+    if ext is None:
+        raise HTTPException(status_code=400, detail="Missing filename.")
+    if ext not in ALLOWED_VOICE_EXT:
         raise HTTPException(status_code=400, detail="Unsupported audio format. Use WAV, MP3, M4A, OGG, or FLAC.")
-    
-    # Ensure directory exists
+
+    # Ensure directory exists (create parent dirs)
     os.makedirs(os.path.dirname(config.VOICE_SAMPLE_PATH), exist_ok=True)
-    
+
     try:
+        written = 0
         with open(config.VOICE_SAMPLE_PATH, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+            while True:
+                chunk = await file.read(1024 * 64)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > MAX_UPLOAD_BYTES:
+                    buffer.close()
+                    try:
+                        os.remove(config.VOICE_SAMPLE_PATH)
+                    except OSError:
+                        pass
+                    raise HTTPException(status_code=413, detail="File too large.")
+                buffer.write(chunk)
         logger.info(f"Custom voice sample uploaded successfully: {config.VOICE_SAMPLE_PATH}")
         return {"status": "success", "file_path": config.VOICE_SAMPLE_PATH}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save voice sample: {e}")
 
@@ -198,27 +259,40 @@ async def start_agent(request: StartAgentRequest):
     if state.orchestrator_task and not state.orchestrator_task.done():
         raise HTTPException(status_code=400, detail="Agent is already running.")
 
-    meet_url = request.meeting_url or config.MEETING_URL
+    meet_url = (request.meeting_url or config.MEETING_URL or "").strip()
     if not meet_url:
         raise HTTPException(
             status_code=400, 
             detail="Meeting URL is required. Provide via request or environment/config.py."
         )
+    parsed = urlparse(meet_url)
+    if not parsed.scheme or not parsed.netloc:
+        raise HTTPException(status_code=400, detail="Meeting URL is not a valid URL.")
+
+    bot_name = (request.bot_name or "Humail").strip() or "Humail"
+    llm_provider = request.llm_provider or "ollama"
+    if llm_provider not in ("ollama", "gemini"):
+        raise HTTPException(status_code=400, detail="llm_provider must be 'ollama' or 'gemini'.")
 
     state.meeting_url = meet_url
-    state.bot_name = request.bot_name
+    state.bot_name = bot_name
     state.current_status = "starting"
 
     # Assemble custom persona if candidate_data is supplied
     custom_persona = None
     if request.candidate_data:
-        data = request.candidate_data
+        data = request.candidate_data or {}
+        skills = data.get("skills", [])
+        if isinstance(skills, list):
+            skills_str = ", ".join(str(s) for s in skills if s) or "Python"
+        else:
+            skills_str = str(skills) or "Python"
         custom_persona = (
             f"Candidate Profile:\n"
-            f"- Name: {data.get('name', request.bot_name)}\n"
+            f"- Name: {data.get('name', bot_name)}\n"
             f"- Education: {data.get('education', 'BS AI/CS')}\n"
             f"- Experience: {data.get('experience', 'AI Agent Developer')}\n"
-            f"- Skills: {', '.join(data.get('skills', [])) if isinstance(data.get('skills'), list) else data.get('skills', 'Python')}\n"
+            f"- Skills: {skills_str}\n"
             f"- Personality: {data.get('personality', 'confident')}\n"
             f"- Speaking Style Rules: Never say 'As an AI', use natural fillers like 'well' or 'you know', be concise."
         )
@@ -226,8 +300,8 @@ async def start_agent(request: StartAgentRequest):
     # Instantiate the Orchestrator
     orchestrator = InterviewAgentOrchestrator(
         meeting_url=meet_url,
-        bot_name=request.bot_name,
-        llm_provider=request.llm_provider
+        bot_name=bot_name,
+        llm_provider=llm_provider
     )
     
     if custom_persona:
@@ -236,13 +310,26 @@ async def start_agent(request: StartAgentRequest):
 
     state.orchestrator = orchestrator
     
+    # Persist the session so /status survives restarts (SaaS claim).
+    try:
+        state_store.save_session(
+            session_id="active",
+            meeting_url=meet_url,
+            bot_name=bot_name,
+            status="starting",
+            avatar_path=config.AVATAR_IMAGE_PATH,
+            voice_path=config.VOICE_SAMPLE_PATH,
+        )
+    except Exception as e:
+        logger.warning(f"Could not persist session to store: {e}")
+
     # Spawn orchestrator in the asyncio background
     state.orchestrator_task = asyncio.create_task(run_orchestrator_background(orchestrator))
 
     return {
         "status": "starting",
-        "message": f"Successfully launched AI agent '{request.bot_name}' to join {meet_url}",
-        "bot_name": request.bot_name,
+        "message": f"Successfully launched AI agent '{bot_name}' to join {meet_url}",
+        "bot_name": bot_name,
         "meeting_url": meet_url
     }
 
@@ -254,12 +341,20 @@ async def stop_agent():
     logger.info("Received request to stop the active AI Agent.")
     state.current_status = "stopped"
     
-    # Trigger orchestrator shutdown
-    await state.orchestrator.shutdown()
+    # Trigger orchestrator shutdown with a safety timeout so a hung client call
+    # cannot block this endpoint forever.
+    try:
+        await asyncio.wait_for(state.orchestrator.shutdown(), timeout=30.0)
+    except asyncio.TimeoutError:
+        logger.error("Orchestrator shutdown timed out after 30s; forcing task cancel.")
     
     # Cancel the asyncio task
     if state.orchestrator_task:
         state.orchestrator_task.cancel()
+        try:
+            await state.orchestrator_task
+        except (asyncio.CancelledError, Exception):
+            pass
         state.orchestrator_task = None
 
     state.orchestrator = None
@@ -279,7 +374,7 @@ async def get_status():
         "bot_name": state.bot_name,
         "call_id": call_id,
         "pika_session_id": pika_id,
-        "coqui_xtts_active": hasattr(state.orchestrator, "cloner") and state.orchestrator.cloner.is_initialized if state.orchestrator else False
+        "coqui_xtts_active": bool(state.orchestrator and getattr(state.orchestrator.cloner, "is_initialized", False)) if state.orchestrator else False
     }
 
 @app.websocket("/ws/session/{session_id}")

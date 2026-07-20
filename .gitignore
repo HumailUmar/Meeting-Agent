@@ -1,4 +1,8 @@
-```
+# SQLite state store (generated at runtime)
+sessions.db
+*.db
+*.sqlite3
+
 # Python
 __pycache__/
 *.py[cod]

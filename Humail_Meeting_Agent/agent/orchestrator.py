@@ -29,21 +29,44 @@ class InterviewAgentOrchestrator:
     Main orchestrator that coordinates meeting joining, transcription, 
     AI brain answer generation, voice cloning synthesis, and avatar rendering.
     """
-    def __init__(self, meeting_url: str, bot_name: str, llm_provider: str = "ollama"):
+    async def __init__(self, meeting_url: str, bot_name: str, llm_provider: str = "ollama"):
         self.meeting_url = meeting_url
-        self.bot_name = bot_name
+        self.bot_name = (bot_name or "Agent").strip() or "Agent"
         self.llm_provider = llm_provider
-        
+
         # Instantiate modules
         self.brain = AIBrain(provider=llm_provider)
         self.cloner = VoiceCloner(voice_sample_path=config.VOICE_SAMPLE_PATH)
         self.avatar_manager = AvatarManager()
         self.transcriber = AudioTranscriber()
-        
+
         self.session = None
         self.pika_session_id = None
         self.is_running = False
         self._main_task = None
+        self._shutting_down = False
+        # Echo-loop protection: remember recent question hashes.
+        self._recent_questions = set()
+
+    def _question_hash(self, text: str) -> str:
+        import hashlib
+        return hashlib.sha256(text.strip().lower().encode("utf-8")).hexdigest()[:16]
+
+    def _is_duplicate_question(self, text: str) -> bool:
+        h = self._question_hash(text)
+        if h in self._recent_questions:
+            return True
+        self._recent_questions.add(h)
+        # Bound the dedup set.
+        if len(self._recent_questions) > 200:
+            self._recent_questions.clear()
+        return False
+
+    async def _safe_client(self):
+        """Return the active AgentCall client, or None if not joined."""
+        if self.session and isinstance(self.session, dict) and self.session.get("client"):
+            return self.session["client"]
+        return None
 
     async def start(self):
         """Starts the autonomous agent orchestrator."""
@@ -96,7 +119,16 @@ class InterviewAgentOrchestrator:
         except Exception as e:
             logger.warning(f"Deepgram initialization skipped or failed: {e}. Falling back to AgentCall WebSocket transcripts.")
 
-        # Step 4: Run the main Event Loop
+        # Health check: AgentCall's native transcript stream is the baseline source
+        # (it works without a soundcard). Deepgram is an optional enhancement.
+        # As long as we have an active session, the event loop will receive
+        # transcript.final events. If the session is missing, abort.
+        if not self.session:
+            logger.error("No active meeting session; cannot continue. Aborting start.")
+            await self.shutdown()
+            return
+
+        # Step4: Run the main Event Loop
         self._main_task = asyncio.create_task(self._run_event_loop())
         await self._main_task
 
@@ -104,8 +136,16 @@ class InterviewAgentOrchestrator:
         """
         Listens to real-time events on AgentCall's meeting WebSocket (transcripts, participant changes, call ended).
         """
-        client = self.session["client"]
-        call_id = self.session["call_id"]
+        client = await self._safe_client()
+        if client is None or not self.session:
+            logger.error("Event loop started without a valid meeting session; aborting.")
+            await self.shutdown()
+            return
+        call_id = self.session.get("call_id")
+        if not call_id:
+            logger.error("Event loop started without a call_id; aborting.")
+            await self.shutdown()
+            return
 
         logger.info("Listening for interview questions...")
         try:
@@ -113,6 +153,9 @@ class InterviewAgentOrchestrator:
                 if not self.is_running:
                     break
 
+                if not isinstance(event, dict):
+                    logger.warning(f"Skipping non-dict WS event: {type(event)}")
+                    continue
                 event_type = event.get("event") or event.get("type", "")
 
                 # Handle call ended
@@ -122,11 +165,14 @@ class InterviewAgentOrchestrator:
 
                 # Fallback to AgentCall's native transcription stream if Deepgram capture is inactive
                 elif event_type == "transcript.final" and not self.transcriber.is_running:
-                    speaker = event.get("speaker", "Unknown")
-                    text = event.get("text", "")
-                    
+                    speaker = (event.get("speaker") or "Unknown")
+                    text = (event.get("text") or "").strip()
+
                     # Ignore own speech to prevent echo response loops
-                    if speaker.lower() != self.bot_name.lower():
+                    if speaker.lower() != self.bot_name.lower() and text:
+                        if self._is_duplicate_question(text):
+                            logger.info(f"Skipping duplicate transcript: {text[:60]}")
+                            continue
                         logger.info(f"[Transcript Received] {speaker}: {text}")
                         await self._process_question(text)
 
@@ -148,11 +194,15 @@ class InterviewAgentOrchestrator:
             async for data in self.transcriber.get_transcriptions():
                 if not self.is_running:
                     break
-                
-                text = data.get("text", "")
+                if not isinstance(data, dict):
+                    continue
+                text = (data.get("text") or "").strip()
                 is_final = data.get("is_final", False)
-                
-                if is_final and text.strip():
+
+                if is_final and text:
+                    if self._is_duplicate_question(text):
+                        logger.info(f"Skipping duplicate Deepgram transcript: {text[:60]}")
+                        continue
                     logger.info(f"[Deepgram Live Transcript] {text}")
                     await self._process_question(text)
         except asyncio.CancelledError:
@@ -163,34 +213,52 @@ class InterviewAgentOrchestrator:
     async def _process_question(self, question: str):
         """
         Handles responding to a detected question:
-        updates states, generates AI brain response, converts to speech, 
+        updates states, generates AI brain response, converts to speech,
         and plays audio (with lip-sync synced automatically).
         """
-        client = self.session["client"]
-        
+        question = (question or "").strip()
+        if not question:
+            return
+
+        client = await self._safe_client()
+        if client is None:
+            logger.error("Cannot process question: meeting session/client unavailable.")
+            return
+
         # 1. Update state to 'thinking' (activates thinking indicator on Pika / AgentCall template)
         logger.info("Thinking of an answer...")
         await client.send_command({"type": "voice.state_update", "state": "thinking"})
 
         # 2. Generate answer via AI Brain with token streaming
         response_text = ""
-        async for chunk in self.brain.generate_answer(question):
-            response_text += chunk
-            # Print to stdout in real-time
-            sys.stdout.write(chunk)
-            sys.stdout.flush()
+        try:
+            async for chunk in self.brain.generate_answer(question):
+                response_text += chunk
+                # Print to stdout in real-time
+                sys.stdout.write(chunk)
+                sys.stdout.flush()
+        except Exception as e:
+            logger.error(f"Error during answer generation: {e}")
+            response_text = response_text or "Sorry, I had a small hiccup there. Could you repeat the question?"
         sys.stdout.write("\n")
 
         # 3. Speak the answer (converts text to speech and injects raw PCM/TTS into call)
         if response_text.strip():
             logger.info("Speaking the answer...")
-            await self.cloner.speak(client, response_text)
+            try:
+                await self.cloner.speak(client, response_text)
+            except Exception as e:
+                logger.error(f"Error while speaking answer: {e}")
 
     async def shutdown(self):
         """Gracefully releases resources and leaves the meeting call."""
-        if not self.is_running:
+        if self._shutting_down:
             return
-            
+        self._shutting_down = True
+        if not self.is_running:
+            logger.info("Shutdown already completed.")
+            return
+
         self.is_running = False
         logger.info("Starting graceful shutdown...")
 
@@ -208,9 +276,9 @@ class InterviewAgentOrchestrator:
                 logger.error(f"Error leaving Pika session: {e}")
 
         # 3. Leave and clean up AgentCall meeting session
-        if self.session and "client" in self.session:
-            client = self.session["client"]
-            call_id = self.session["call_id"]
+        client = self.session.get("client") if isinstance(self.session, dict) else None
+        call_id = self.session.get("call_id") if isinstance(self.session, dict) else None
+        if client and call_id:
             try:
                 logger.info(f"Ending AgentCall meeting session: {call_id}")
                 await client.end_call(call_id)
@@ -221,7 +289,12 @@ class InterviewAgentOrchestrator:
         # Cancel main task if running
         if self._main_task and not self._main_task.done():
             self._main_task.cancel()
+            try:
+                await self._main_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
+        self.session = None
         logger.info("Graceful shutdown completed successfully. Offline.")
 
 # CLI Execution

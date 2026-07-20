@@ -3,13 +3,20 @@ import json
 import logging
 import os
 import sys
-from typing import AsyncGenerator, Optional
+from typing import AsyncGenerator, List, Optional
 import aiohttp
 
 import config
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Maximum conversation turns (user+assistant) to retain after the system prompt.
+# Prevents unbounded history growth (OOM / context overflow) on long interviews.
+MAX_HISTORY_TURNS = int(os.getenv("MAX_HISTORY_TURNS", "20"))
+
+# aiohttp client timeout for external LLM calls (seconds).
+HTTP_TIMEOUT = aiohttp.ClientTimeout(total=float(os.getenv("LLM_HTTP_TIMEOUT", "60")))
 
 # Default Persona Prompt including candidate name, education, work experience, skills, personality, and speaking style rules
 DEFAULT_PERSONA = """
@@ -71,6 +78,19 @@ class AIBrain:
         """Resets the history while maintaining the initial persona setup."""
         self._init_history()
 
+    def _trim_history(self):
+        """Keep the initial system/persona turn(s) and cap recent turns to avoid OOM/context overflow."""
+        if self.provider == "gemini":
+            # history[0] = user (system instruction), history[1] = model (ack)
+            keep = 2
+        else:
+            keep = 1  # ollama/system prompt
+        recent = self.history[keep:]
+        max_recent = MAX_HISTORY_TURNS * 2
+        if len(recent) > max_recent:
+            recent = recent[-max_recent:]
+        self.history = self.history[:keep] + recent
+
     async def generate_answer(self, question: str) -> AsyncGenerator[str, None]:
         """
         Appends the question to the history and streams the response token by token.
@@ -81,79 +101,95 @@ class AIBrain:
         Yields:
             str: Response tokens/words as they are generated.
         """
-        logger.info(f"Generating answer using {self.provider} ({self.model}) for: '{question}'")
-        
+        question = (question or "").strip()
+        if not question:
+            logger.warning("generate_answer called with empty question; ignoring.")
+            return
+
+        logger.info(f"Generating answer using {self.provider} ({self.model}) for: '{question[:80]}'")
+
+        fallback_ollama = "Well, honestly, I'm having a brief connection issue with my local LLM server, but I'd love to share my experience with that in a moment."
+        fallback_gemini = "Actually, there is a minor network interruption on my end. But going back to your question, I believe my skills are highly aligned."
+
         if self.provider == "ollama":
             self.history.append({"role": "user", "content": question})
-            
+
             try:
                 import ollama
                 client = ollama.AsyncClient(host=config.OLLAMA_HOST)
                 full_response = ""
-                async for chunk in await client.chat(model=self.model, messages=self.history, stream=True):
-                    content = chunk.get("message", {}).get("content", "")
+                # NOTE: client.chat() is an async generator; do NOT await it.
+                async for chunk in client.chat(model=self.model, messages=self.history, stream=True):
+                    content = (chunk.get("message", {}) or {}).get("content", "")
                     if content:
                         full_response += content
                         yield content
-                
+
                 self.history.append({"role": "assistant", "content": full_response})
+                self._trim_history()
             except Exception as e:
                 logger.error(f"Ollama error: {e}")
-                fallback = "Well, honestly, I'm having a brief connection issue with my local LLM server, but I'd love to share my experience with that in a moment."
-                yield fallback
-                self.history.append({"role": "assistant", "content": fallback})
-                
+                yield fallback_ollama
+                self.history.append({"role": "assistant", "content": fallback_ollama})
+                self._trim_history()
+
         elif self.provider == "gemini":
             self.history.append({"role": "user", "parts": [{"text": question}]})
-            
+
             api_key = os.getenv("GEMINI_API_KEY") or os.environ.get("GEMINI_API_KEY")
             if not api_key:
                 logger.error("GEMINI_API_KEY is not set.")
-                fallback = "Honestly, I seem to be experiencing a bit of network lag and cannot access my knowledge base right now."
-                yield fallback
-                self.history.append({"role": "model", "parts": [{"text": fallback}]})
+                yield fallback_gemini
+                self.history.append({"role": "model", "parts": [{"text": fallback_gemini}]})
                 return
 
             # Gemini streamGenerateContent URL
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:streamGenerateContent?key={api_key}"
             payload = {"contents": self.history}
-            
+
             full_response = ""
             try:
-                async with aiohttp.ClientSession() as session:
+                async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
                     async with session.post(url, json=payload) as resp:
                         if resp.status != 200:
                             err_msg = await resp.text()
-                            logger.error(f"Gemini API error ({resp.status}): {err_msg}")
+                            logger.error(f"Gemini API error ({resp.status}): {err_msg[:500]}")
                             raise RuntimeError("Gemini API error")
-                            
+
                         # Parse the JSON streaming response
                         async for line in resp.content:
                             line_str = line.decode('utf-8').strip()
                             if not line_str:
                                 continue
-                            
+
                             # Clean array elements if returned in a stream array
                             if line_str.startswith("data:"):
                                 line_str = line_str[5:].strip()
                             elif line_str.startswith("[") or line_str.startswith(","):
                                 line_str = line_str.strip("[], ")
-                            
+
                             if not line_str:
                                 continue
-                                
+
                             try:
                                 chunk_json = json.loads(line_str)
-                                part_text = chunk_json["candidates"][0]["content"]["parts"][0]["text"]
+                                candidates = (chunk_json.get("candidates") or [])
+                                if not candidates:
+                                    continue
+                                parts = (candidates[0].get("content") or {}).get("parts") or []
+                                if not parts:
+                                    continue
+                                part_text = parts[0].get("text", "")
                                 if part_text:
                                     full_response += part_text
                                     yield part_text
-                            except Exception:
-                                pass
-                                
+                            except (json.JSONDecodeError, KeyError, IndexError, TypeError) as e:
+                                logger.debug(f"Skipping malformed Gemini chunk: {e}")
+
                 self.history.append({"role": "model", "parts": [{"text": full_response}]})
+                self._trim_history()
             except Exception as e:
                 logger.error(f"Gemini API connection error: {e}")
-                fallback = "Actually, there is a minor network interruption on my end. But going back to your question, I believe my skills are highly aligned."
-                yield fallback
-                self.history.append({"role": "model", "parts": [{"text": fallback}]})
+                yield fallback_gemini
+                self.history.append({"role": "model", "parts": [{"text": fallback_gemini}]})
+                self._trim_history()

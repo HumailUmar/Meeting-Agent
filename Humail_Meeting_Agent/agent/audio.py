@@ -22,22 +22,36 @@ class AudioTranscriber:
     """
     Handles real-time audio capture and streaming to Deepgram's live transcription API.
     """
-    def __init__(self, api_key: Optional[str] = None, sample_rate: int = 16000, channels: int = 1):
+    def __init__(self, api_key: Optional[str] = None, sample_rate: int = 16000, channels: int = 1, max_queue_size: int = 200):
         self.api_key = api_key or config.DEEPGRAM_API_KEY or os.environ.get("DEEPGRAM_API_KEY")
         self.sample_rate = sample_rate
         self.channels = channels
-        self.audio_queue: asyncio.Queue = asyncio.Queue()
+        # Bounded queue to avoid unbounded memory growth if the socket is slow.
+        self.audio_queue: asyncio.Queue = asyncio.Queue(maxsize=max_queue_size)
         self.dg_ws = None
         self.stream = None
         self.is_running = False
         self._sender_task: Optional[asyncio.Task] = None
 
     def _audio_callback(self, indata, frames, time, status):
-        """Callback from sounddevice InputStream."""
+        """Callback from sounddevice InputStream (runs in sounddevice's C thread)."""
         if status:
             logger.warning(f"Audio capture warning: {status}")
-        # Put the raw 16-bit PCM bytes into our queue
-        self.audio_queue.put_nowait(indata.tobytes())
+        if not self.is_running:
+            return
+        try:
+            # Non-blocking put; drop oldest if the consumer is falling behind.
+            self.audio_queue.put_nowait(indata.tobytes())
+        except asyncio.QueueFull:
+            logger.warning("Audio queue full; dropping oldest frame to bound memory.")
+            try:
+                self.audio_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            try:
+                self.audio_queue.put_nowait(indata.tobytes())
+            except asyncio.QueueFull:
+                pass
 
     async def connect_deepgram(self):
         """
@@ -56,10 +70,19 @@ class AudioTranscriber:
             f"&punctuate=true"
         )
         headers = {"Authorization": f"Token {self.api_key}"}
-        
+
         logger.info("Connecting to Deepgram live transcription WebSocket...")
         try:
-            self.dg_ws = await websockets.connect(url, extra_headers=headers)
+            # NOTE: websockets.connect() uses `additional_headers` (older: `extra_headers`).
+            # Support both to stay compatible across library versions.
+            import inspect
+            kwargs = {}
+            sig = inspect.signature(websockets.connect)
+            if "additional_headers" in sig.parameters:
+                kwargs["additional_headers"] = headers
+            else:
+                kwargs["extra_headers"] = headers
+            self.dg_ws = await websockets.connect(url, **kwargs)
             logger.info("Successfully connected to Deepgram WebSocket.")
         except Exception as e:
             logger.error(f"Failed to connect to Deepgram WebSocket: {e}")
@@ -159,10 +182,20 @@ class AudioTranscriber:
 
         try:
             async for message in self.dg_ws:
-                data = json.loads(message)
-                channel = data.get("channel", {})
-                alternatives = channel.get("alternatives", [{}])
-                transcript = alternatives[0].get("transcript", "")
+                try:
+                    line = await self.dg_ws.recv()
+                except websockets.ConnectionClosed:
+                    break
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    logger.debug("Skipping non-JSON Deepgram frame.")
+                    continue
+                channel = (data.get("channel") or {})
+                alternatives = (channel.get("alternatives") or [{}])
+                transcript = (alternatives[0] or {}).get("transcript", "")
                 is_final = data.get("is_final", False)
 
                 if transcript.strip():

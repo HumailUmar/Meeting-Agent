@@ -60,7 +60,7 @@ class VoiceCloner:
             return False
 
         if not os.path.exists(self.voice_sample_path):
-            logger.error(f"Voice reference sample file missing at: {self.voice_sample_path}")
+            logger.error(f"Voice reference sample file missing at: {self.voice_sample_path}. Using native TTS fallback.")
             return False
 
         try:
@@ -84,6 +84,10 @@ class VoiceCloner:
             client (AgentCallClient): Reference to the active AgentCall session client.
             text (str): The text content to speak.
         """
+        if client is None:
+            logger.error("VoiceCloner.speak called without a valid client; skipping.")
+            return
+
         if COQUI_AVAILABLE and self.is_initialized:
             with tempfile.TemporaryDirectory() as tmpdir:
                 wav_path = os.path.join(tmpdir, "cloned.wav")
@@ -95,38 +99,49 @@ class VoiceCloner:
                 if success and os.path.exists(wav_path):
                     # Convert to raw PCM 16kHz 16-bit mono using ffmpeg (AgentCall spec)
                     try:
-                        logger.info("Resampling cloned voice to PCM 16kHz 16-bit mono...")
-                        cmd = [
-                            "ffmpeg", "-i", wav_path,
-                            "-acodec", "pcm_s16le",
-                            "-ac", "1",
-                            "-ar", "16000",
-                            pcm_path, "-y"
-                        ]
-                        process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                        
-                        if process.returncode == 0 and os.path.exists(pcm_path):
-                            with open(pcm_path, "rb") as f:
-                                pcm_bytes = f.read()
+                        # Ensure ffmpeg is actually available before attempting conversion.
+                        subprocess.run(
+                            ["ffmpeg", "-version"],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
+                        )
+                    except (FileNotFoundError, subprocess.CalledProcessError):
+                        logger.error("ffmpeg not found; falling back to native TTS.")
+                        success = False
+
+                    if success:
+                        try:
+                            logger.info("Resampling cloned voice to PCM 16kHz 16-bit mono...")
+                            cmd = [
+                                "ffmpeg", "-i", wav_path,
+                                "-acodec", "pcm_s16le",
+                                "-ac", "1",
+                                "-ar", "16000",
+                                pcm_path, "-y"
+                            ]
+                            process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                             
-                            # Base64 encode raw PCM bytes
-                            b64_data = base64.b64encode(pcm_bytes).decode('utf-8')
-                            
-                            # Set voice state to speaking and inject audio
-                            logger.info("Injecting raw cloned voice PCM into the meeting call...")
-                            await client.send_command({"type": "voice.state_update", "state": "speaking"})
-                            await client.send_command({"type": "audio.inject", "data": b64_data})
-                            
-                            # Simulate speech duration (PCM Mono 16kHz 16-bit = 32000 bytes/sec)
-                            duration = len(pcm_bytes) / 32000.0
-                            await asyncio.sleep(duration)
-                            
-                            await client.send_command({"type": "voice.state_update", "state": "listening"})
-                            return
-                        else:
-                            logger.error(f"FFmpeg failed with: {process.stderr.decode()}")
-                    except Exception as e:
-                        logger.error(f"Exception during FFmpeg conversion: {e}")
+                            if process.returncode == 0 and os.path.exists(pcm_path):
+                                with open(pcm_path, "rb") as f:
+                                    pcm_bytes = f.read()
+                                
+                                # Base64 encode raw PCM bytes
+                                b64_data = base64.b64encode(pcm_bytes).decode('utf-8')
+                                
+                                # Set voice state to speaking and inject audio
+                                logger.info("Injecting raw cloned voice PCM into the meeting call...")
+                                await client.send_command({"type": "voice.state_update", "state": "speaking"})
+                                await client.send_command({"type": "audio.inject", "data": b64_data})
+                                
+                                # Simulate speech duration (PCM Mono 16kHz 16-bit = 32000 bytes/sec)
+                                duration = len(pcm_bytes) / 32000.0
+                                await asyncio.sleep(duration)
+                                
+                                await client.send_command({"type": "voice.state_update", "state": "listening"})
+                                return
+                            else:
+                                logger.error(f"FFmpeg failed with: {process.stderr.decode()}")
+                        except Exception as e:
+                            logger.error(f"Exception during FFmpeg conversion: {e}")
                         
         # Robust fallback using AgentCall's highly optimized native TTS
         logger.info(f"Using AgentCall's native TTS to speak: '{text}'")
