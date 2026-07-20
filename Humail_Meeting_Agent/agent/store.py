@@ -1,0 +1,105 @@
+import json
+import os
+import sqlite3
+from pathlib import Path
+from typing import Dict, List, Optional
+
+import config
+
+DB_PATH = Path(__file__).resolve().parent.parent / "sessions.db"
+
+class SQLiteStateStore:
+    """
+    SaaS Production-Grade State Store backed by SQLite.
+    Allows multiple parallel FastAPI nodes to share active session states safely.
+    """
+    def __init__(self):
+        self._init_db()
+
+    def _get_conn(self):
+        conn = sqlite3.connect(str(DB_PATH))
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _init_db(self):
+        with self._get_conn() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS sessions (
+                    session_id TEXT PRIMARY KEY,
+                    meeting_url TEXT,
+                    bot_name TEXT,
+                    status TEXT,
+                    avatar_path TEXT,
+                    voice_path TEXT,
+                    call_id TEXT,
+                    pika_session_id TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            conn.commit()
+
+    def save_session(
+        self, 
+        session_id: str, 
+        meeting_url: str, 
+        bot_name: str, 
+        status: str, 
+        avatar_path: str, 
+        voice_path: str,
+        call_id: Optional[str] = None,
+        pika_session_id: Optional[str] = None
+    ):
+        with self._get_conn() as conn:
+            conn.execute("""
+                INSERT INTO sessions (session_id, meeting_url, bot_name, status, avatar_path, voice_path, call_id, pika_session_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    status=excluded.status,
+                    call_id=COALESCE(excluded.call_id, sessions.call_id),
+                    pika_session_id=COALESCE(excluded.pika_session_id, sessions.pika_session_id)
+            """, (session_id, meeting_url, bot_name, status, avatar_path, voice_path, call_id, pika_session_id))
+            conn.commit()
+
+    def get_session(self, session_id: str) -> Optional[dict]:
+        with self._get_conn() as conn:
+            row = conn.execute("SELECT * FROM sessions WHERE session_id=?", (session_id,)).fetchone()
+            if row:
+                return dict(row)
+        return None
+
+    def delete_session(self, session_id: str):
+        with self._get_conn() as conn:
+            conn.execute("DELETE FROM sessions WHERE session_id=?", (session_id,))
+            conn.commit()
+
+    def list_active_sessions(self) -> List[dict]:
+        with self._get_conn() as conn:
+            rows = conn.execute("SELECT * FROM sessions ORDER BY created_at DESC").fetchall()
+            return [dict(r) for r in rows]
+
+# Abstract Memory Fallback for testing environments
+class MemoryStateStore:
+    def __init__(self):
+        self.sessions: Dict[str, dict] = {}
+
+    def save_session(self, session_id, **kwargs):
+        if session_id not in self.sessions:
+            self.sessions[session_id] = {}
+        self.sessions[session_id].update(kwargs)
+        self.sessions[session_id]["session_id"] = session_id
+
+    def get_session(self, session_id) -> Optional[dict]:
+        return self.sessions.get(session_id)
+
+    def delete_session(self, session_id):
+        if session_id in self.sessions:
+            del self.sessions[session_id]
+
+    def list_active_sessions(self) -> List[dict]:
+        return list(self.sessions.values())
+
+def get_state_store():
+    """Factory to load persistent database store or testing memory store."""
+    if config.STATE_STORE_TYPE == "sqlite":
+        return SQLiteStateStore()
+    return MemoryStateStore()
