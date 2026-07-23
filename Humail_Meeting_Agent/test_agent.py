@@ -1,8 +1,10 @@
+import aiohttp
 import asyncio
 import json
 import os
 import sys
 import unittest
+from abc import ABC
 from unittest.mock import AsyncMock, MagicMock, patch
 
 # Setup paths to ensure we can import our modules correctly
@@ -14,6 +16,10 @@ from agent.audio import AudioTranscriber
 from agent.brain import AIBrain, DEFAULT_PERSONA
 from agent.voice import VoiceCloner
 from agent.avatar import AvatarManager
+from agent.avatar.base import AvatarProvider, AvatarProviderQuotaError
+from agent.avatar.did_provider import DIdProvider
+from agent.orchestrator import InterviewAgentOrchestrator
+
 
 class TestAIInterviewAgent(unittest.IsolatedAsyncioTestCase):
     """
@@ -38,7 +44,7 @@ class TestAIInterviewAgent(unittest.IsolatedAsyncioTestCase):
     async def test_meeting_joining(self, mock_client_class):
         """Verifies the bot joins Google Meet with the correct direct webpage-av template."""
         print("\n[TEST] Verifying meeting joining module...")
-        
+
         # Mock AgentCall API Response
         mock_client_instance = mock_client_class.return_value
         mock_client_instance.create_call = AsyncMock(return_value={
@@ -122,9 +128,9 @@ class TestAIInterviewAgent(unittest.IsolatedAsyncioTestCase):
     async def test_voice_cloning_and_tts(self, mock_subprocess, mock_tts_class):
         """Verifies Coqui XTTS speech conversion, resampling, and audio injection logic."""
         print("\n[TEST] Verifying Voice Cloning & TTS pipeline...")
-        cloner = VoiceCloner(voice_sample_path="dummy_sample.wav")
+        cloner = VoiceCloner(voice_sample_path="dummy_sample.wav", voice_clone_provider="local")
         cloner.is_initialized = True
-        
+
         mock_tts_instance = mock_tts_class.return_value
         cloner.tts = mock_tts_instance
 
@@ -142,57 +148,303 @@ class TestAIInterviewAgent(unittest.IsolatedAsyncioTestCase):
         # Patch 'open' and 'os.path.exists' to simulate reading the raw converted PCM file
         with patch("os.path.exists", return_value=True), \
              patch("builtins.open", unittest.mock.mock_open(read_data=b"rawpcmbytes123")):
-            
             await cloner.speak(mock_client, "Hello, I am Humail.")
 
             # Verify avatar was set to speaking, audio injected, and state returned to listening
             mock_client.send_command.assert_any_call({"type": "voice.state_update", "state": "speaking"})
-            mock_client.send_command.assert_any_call({"type": "audio.inject", "data": "cmF3cGNtYnl0ZXMxMjM="}) # b64 of rawpcmbytes123
+            mock_client.send_command.assert_any_call({"type": "audio.inject", "data": "cmF3cGNtYnl0ZXMxMjM="})  # b64 of rawpcmbytes123
             mock_client.send_command.assert_any_call({"type": "voice.state_update", "state": "listening"})
 
         print("[SUCCESS] Voice cloning generation, ffmpeg resampling, and audio injection commands verified!")
 
+
     @patch("asyncio.create_subprocess_exec")
-    async def test_avatar_integration(self, mock_subprocess_exec):
-        """Verifies PikaStream avatar session initialization and leave command."""
-        print("\n[TEST] Verifying Avatar Integration (Pika)...")
-        avatar = AvatarManager(pika_dev_key="mock_pika_key")
+    async def test_avatar_provider_contract(self, mock_subprocess_exec):
+        """Verifies AvatarProvider abstract contract and AvatarManager delegation."""
+        print("\n[TEST] Verifying Avatar Provider Contract and Delegation...")
 
-        # Mock stdout reader of the join subprocess to simulate PikaStream returning a ready status
-        mock_process = AsyncMock()
-        mock_process.stdout.readline = AsyncMock(side_effect=[
-            b'{"session_id": "pika-sess-777", "status": "created"}\n',
-            b'{"session_id": "pika-sess-777", "status": "ready", "video": true, "bot": true}\n',
-            b'' # EOF
-        ])
-        mock_process.stderr.read = AsyncMock(return_value=b'')
-        # Subprocess terminate/kill/wait are sync in real code; use plain mocks
-        # to avoid unawaited-coroutine ResourceWarnings under AsyncMock.
-        mock_process.terminate = MagicMock()
-        mock_process.kill = MagicMock()
-        mock_process.wait = MagicMock(return_value=0)
-        mock_subprocess_exec.return_value = mock_process
+        class ConcreteProvider(AvatarProvider):
+            async def create_avatar(self, photo_path: str, resume: str, name: str) -> str:
+                return "avatar-123"
+            async def clone_voice(self, voice_sample_path: str) -> str:
+                return "voice-456"
+            async def start_stream(self, avatar_id: str, voice_id: str) -> dict:
+                return {"session_id": "sess-1", "stream_url": "http://example.com/stream"}
+            async def send_audio(self, session_id: str, audio_bytes: bytes) -> None:
+                pass
+            async def stop_stream(self, session_id: str) -> None:
+                pass
 
-        # Patch os.path.exists to return True so it doesn't fail on missing placeholder avatar image
-        with patch("os.path.exists", return_value=True):
-            session_id = await avatar.join_avatar_meeting(
-                meet_url="https://meet.google.com/xyz-abc-123",
-                bot_name="Humail",
-                image_path=config.AVATAR_IMAGE_PATH
+        provider = ConcreteProvider()
+        manager = AvatarManager(provider=provider)
+
+        self.assertEqual(await manager.create_avatar("img.png", "resume", "Bot"), "avatar-123")
+        self.assertEqual(await manager.clone_voice("voice.wav"), "voice-456")
+        result = await manager.start_stream("avatar-123", "voice-456")
+        self.assertEqual(result["session_id"], "sess-1")
+        await manager.send_audio("sess-1", b"audio")
+        await manager.stop_stream("sess-1")
+
+        noop_manager = AvatarManager(provider=None)
+        self.assertEqual(await noop_manager.create_avatar("img.png", "resume", "Bot"), "")
+        self.assertEqual(await noop_manager.clone_voice("voice.wav"), "")
+        self.assertEqual(await noop_manager.start_stream("a", "v"), {})
+        await noop_manager.send_audio("s", b"a")
+        await noop_manager.stop_stream("s")
+
+        print("[SUCCESS] Avatar provider contract and delegation verified!")
+
+
+class TestAvatarProviderContract(unittest.IsolatedAsyncioTestCase):
+    """Verifies that AvatarProvider cannot be instantiated directly
+    and that its abstract methods raise NotImplementedError when invoked
+    from the base class."""
+
+    def test_instantiation_raises_type_error(self):
+        with self.assertRaises(TypeError):
+            AvatarProvider()
+
+    async def test_each_method_raises_not_implemented_error(self):
+        with self.subTest(method="create_avatar"):
+            with self.assertRaises(NotImplementedError):
+                await AvatarProvider.create_avatar(None, "photo", "resume", "name")
+        with self.subTest(method="clone_voice"):
+            with self.assertRaises(NotImplementedError):
+                await AvatarProvider.clone_voice(None, "voice.wav")
+        with self.subTest(method="start_stream"):
+            with self.assertRaises(NotImplementedError):
+                await AvatarProvider.start_stream(None, "a", "v")
+        with self.subTest(method="send_audio"):
+            with self.assertRaises(NotImplementedError):
+                await AvatarProvider.send_audio(None, "sess", b"data")
+        with self.subTest(method="stop_stream"):
+            with self.assertRaises(NotImplementedError):
+                await AvatarProvider.stop_stream(None, "sess")
+
+
+class TestAvatarManagerDelegation(unittest.IsolatedAsyncioTestCase):
+    """Verifies AvatarManager delegates calls to its AvatarProvider."""
+
+    async def test_create_avatar_delegates_with_same_args(self):
+        mock_provider = MagicMock(spec=AvatarProvider)
+        mock_provider.create_avatar = AsyncMock(return_value="avatar-123")
+        manager = AvatarManager(provider=mock_provider)
+
+        result = await manager.create_avatar("img.png", "resume", "Bot")
+        mock_provider.create_avatar.assert_called_once_with(
+            "img.png", "resume", "Bot"
+        )
+        self.assertEqual(result, "avatar-123")
+
+
+class TestDIdProviderLifecycle(unittest.IsolatedAsyncioTestCase):
+    """Test the full lifecycle of D-ID provider operations."""
+
+    async def test_full_lifecycle(self):
+        """Mock aiohttp.ClientSession.post to return fake avatar_id, voice_id, stream_url.
+        Assert full lifecycle: create_avatar -> clone_voice -> start_stream -> stop_stream.
+        Assert start_stream returns a dict containing stream_url."""
+
+        with patch("agent.avatar.didi_provider.aiohttp.ClientSession") as mock_session_cls:
+            mock_session = MagicMock()
+            mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+            mock_session.__aexit__ = AsyncMock(return_value=False)
+            mock_session_cls.return_value = mock_session
+
+            mock_resp_avatar = MagicMock()
+            mock_resp_avatar.status = 200
+            mock_resp_avatar.raise_for_status = MagicMock()
+            mock_resp_avatar.json = AsyncMock(return_value={"avatar_id": "avatar-123"})
+            mock_resp_avatar.__aenter__ = AsyncMock(return_value=mock_resp_avatar)
+            mock_resp_avatar.__aexit__ = AsyncMock(return_value=False)
+
+            mock_resp_voice = MagicMock()
+            mock_resp_voice.status = 200
+            mock_resp_voice.raise_for_status = MagicMock()
+            mock_resp_voice.json = AsyncMock(return_value={"voice_id": "voice-456"})
+            mock_resp_voice.__aenter__ = AsyncMock(return_value=mock_resp_voice)
+            mock_resp_voice.__aexit__ = AsyncMock(return_value=False)
+
+            mock_resp_stream = MagicMock()
+            mock_resp_stream.status = 200
+            mock_resp_stream.raise_for_status = MagicMock()
+            mock_resp_stream.json = AsyncMock(return_value={"session_id": "sess-1", "stream_url": "http://example.com/stream", "status": "ready"})
+            mock_resp_stream.__aenter__ = AsyncMock(return_value=mock_resp_stream)
+            mock_resp_stream.__aexit__ = AsyncMock(return_value=False)
+
+            mock_resp_delete = MagicMock()
+            mock_resp_delete.status = 200
+            mock_resp_delete.raise_for_status = MagicMock()
+            mock_resp_delete.__aenter__ = AsyncMock(return_value=mock_resp_delete)
+            mock_resp_delete.__aexit__ = AsyncMock(return_value=False)
+
+            def post_side_effect(url, **kwargs):
+                if "/avatars" in url:
+                    return mock_resp_avatar
+                elif "/voices" in url:
+                    return mock_resp_voice
+                elif "/streams" in url:
+                    return mock_resp_stream
+                raise AssertionError(f"Unexpected POST URL: {url}")
+
+            mock_session.post = MagicMock(side_effect=post_side_effect)
+            mock_session.delete = MagicMock(return_value=mock_resp_delete)
+
+            with patch("builtins.open", unittest.mock.mock_open(read_data=b"fake_image_bytes")):
+                provider = DIdProvider(api_key="test_key")
+                avatar_id = await provider.create_avatar("dummy_photo.jpg", "dummy_resume", "TestBot")
+                self.assertEqual(avatar_id, "avatar-123")
+
+                voice_id = await provider.clone_voice("dummy_voice.wav")
+                self.assertEqual(voice_id, "voice-456")
+
+                result = await provider.start_stream(avatar_id, voice_id)
+                self.assertIn("stream_url", result)
+                self.assertEqual(result["stream_url"], "http://example.com/stream")
+
+                await provider.stop_stream("sess-1")
+
+
+class TestDIdProviderQuota(unittest.IsolatedAsyncioTestCase):
+    """Test that AvatarProviderQuotaError is raised on 401, 402, or 429 responses."""
+
+    async def test_quota_error_on_429(self):
+        """Mock a 429 response from D-ID. Assert AvatarProviderQuotaError is raised."""
+        with patch("agent.avatar.didi_provider.aiohttp.ClientSession") as mock_session_cls:
+            mock_session = MagicMock()
+            mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+            mock_session.__aexit__ = AsyncMock(return_value=False)
+            mock_session_cls.return_value = mock_session
+
+            mock_resp = MagicMock()
+            mock_resp.status = 429
+            mock_resp.raise_for_status = MagicMock()
+            mock_resp.text = AsyncMock(return_value="Rate limit exceeded")
+            mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+            mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+            mock_session.post = MagicMock(return_value=mock_resp)
+
+            with patch("builtins.open", unittest.mock.mock_open(read_data=b"fake_image_bytes")):
+                provider = DIdProvider(api_key="test_key")
+                with self.assertRaises(AvatarProviderQuotaError) as cm:
+                    await provider.create_avatar("dummy_photo.jpg", "dummy_resume", "TestBot")
+                self.assertIn("Rate limit exceeded", str(cm.exception))
+
+
+class TestDIdProviderStopStream404(unittest.IsolatedAsyncioTestCase):
+    """Test that stop_stream handles 404 gracefully without raising."""
+    async def test_stop_stream_404(self):
+        """Mock 404 on DELETE and assert stop_stream does not raise."""
+        with patch("agent.avatar.didi_provider.aiohttp.ClientSession") as mock_session_cls:
+            mock_session = MagicMock()
+            mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+            mock_session.__aexit__ = AsyncMock(return_value=False)
+            mock_session_cls.return_value = mock_session
+
+            mock_resp = MagicMock()
+            mock_resp.status = 404
+            mock_resp.raise_for_status = MagicMock()
+            mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+            mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+            mock_session.delete = MagicMock(return_value=mock_resp)
+
+            provider = DIdProvider(api_key="test_key")
+            await provider.stop_stream("sess-1")
+
+class TestOrchestratorProviderFallback(unittest.IsolatedAsyncioTestCase):
+    """Test orchestrator falls back to AgentCall TTS when avatar provider fails."""
+
+    async def test_fallback_when_start_stream_raises(self):
+        """Mock a DIdProvider whose start_stream raises on first call. 
+        Verify orchestrator catches the error, falls back to AgentCall TTS, and continues."""
+
+        failing_provider = MagicMock(spec=DIdProvider)
+        failing_provider.create_avatar = AsyncMock(return_value="avatar-123")
+        failing_provider.clone_voice = AsyncMock(return_value="voice-456")
+        failing_provider.start_stream = AsyncMock(side_effect=Exception("D-ID stream failed"))
+        failing_provider.send_audio = AsyncMock()
+        failing_provider.stop_stream = AsyncMock()
+
+        with patch("agent.orchestrator.join_meeting", new_callable=AsyncMock) as mock_join, \
+             patch("agent.orchestrator.AudioTranscriber") as mock_transcriber_cls, \
+             patch("agent.orchestrator.AIBrain", new_callable=MagicMock) as mock_brain_cls, \
+             patch("agent.orchestrator.VoiceCloner", new_callable=MagicMock) as mock_cloner_cls, \
+             patch("agent.orchestrator.AvatarManager", new_callable=MagicMock) as mock_avatar_mgr_cls, \
+             patch("agent.orchestrator.state_store") as mock_state_store:
+
+            mock_client = MagicMock()
+            mock_client.send_command = AsyncMock()
+            mock_client.end_call = AsyncMock()
+            mock_client.close = AsyncMock()
+
+            async def empty_ws():
+                if False:
+                    yield
+
+            mock_client.connect_ws = MagicMock(return_value=empty_ws())
+
+            mock_join.return_value = {
+                "call_id": "call-12345",
+                "client": mock_client,
+                "ws_url": "wss://example.com/ws"
+            }
+
+            mock_transcriber = mock_transcriber_cls.return_value
+            mock_transcriber.connect_deepgram = AsyncMock()
+            mock_transcriber.start_capture = AsyncMock(return_value=False)
+            mock_transcriber.stop = AsyncMock()
+            mock_transcriber.is_running = False
+
+            mock_avatar_mgr = mock_avatar_mgr_cls.return_value
+            mock_avatar_mgr.leave_avatar_meeting = AsyncMock()
+
+            orchestrator = InterviewAgentOrchestrator(
+                meeting_url="https://meet.google.com/abc",
+                bot_name="TestBot",
+                avatar_provider=failing_provider
             )
 
-        self.assertEqual(session_id, "pika-sess-777")
-        self.assertEqual(avatar.active_session_id, "pika-sess-777")
-        
-        # Test leave
-        mock_leave_process = AsyncMock()
-        mock_leave_process.returncode = 0
-        mock_leave_process.communicate = AsyncMock(return_value=(b"Success", b""))
-        mock_subprocess_exec.return_value = mock_leave_process
+            await orchestrator.start()
 
-        left = await avatar.leave_avatar_meeting("pika-sess-777")
-        self.assertTrue(left)
-        print("[SUCCESS] PikaStream subprocess spawn and event streaming verified!")
+            self.assertIsNone(orchestrator.avatar_provider)
+            failing_provider.create_avatar.assert_called_once()
+            failing_provider.clone_voice.assert_called_once()
+            failing_provider.start_stream.assert_called_once_with("avatar-123", "voice-456")
+
+
+# Manual Integration Checklist
+# -----------------------------
+# 1. Start the backend server:      uvicorn app:app --port 8000
+# 2. Start the frontend dev server: npm run dev
+# 3. Open the browser and select the D-ID provider
+# 4. Upload a dummy photo and voice sample
+# 5. Enter a valid Google Meet / Zoom URL
+# 6. Click Initialize
+# 7. Verify the bot joins the meeting
+# 8. Verify the avatar page renders in the meeting UI
+# 9. Ask the bot one question and verify it answers
+# 10. End the meeting and verify clean shutdown
+
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDIdProviderSendAudio(unittest.IsolatedAsyncioTestCase):
+    async def test_send_audio_raises_not_implemented(self):
+        """Test that send_audio raises NotImplementedError as expected."""
+        with patch("agent.avatar.didi_provider.aiohttp.ClientSession") as mock_session_cls:
+            mock_session = MagicMock()
+            mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+            mock_session.__aexit__ = AsyncMock(return_value=False)
+            mock_session_cls.return_value = mock_session
+
+            provider = DIdProvider(api_key="test_key")
+            # Setup: create avatar and voice first
+            await provider.create_avatar("dummy_photo.jpg", "dummy_resume", "TestBot")
+            await provider.clone_voice("dummy_voice.wav")
+            await provider.start_stream("avatar-123", "voice-456")
+            with self.assertRaises(NotImplementedError):
+                await provider.send_audio("sess-1", b"audio")

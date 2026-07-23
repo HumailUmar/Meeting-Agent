@@ -25,14 +25,15 @@ class VoiceCloner:
     Clones voices from a reference audio file using Coqui XTTS v2, 
     resamples to the meeting format, and plays it into the session.
     """
-    def __init__(self, voice_sample_path: Optional[str] = None):
+    def __init__(self, voice_sample_path: Optional[str] = None, voice_clone_provider: str = None):
         self.voice_sample_path = voice_sample_path or config.VOICE_SAMPLE_PATH
         self.tts = None
         self.is_initialized = False
+        self.voice_clone_provider = voice_clone_provider
         
-        if COQUI_AVAILABLE:
+        if COQUI_AVAILABLE and self.voice_clone_provider == "local":
             self._init_coqui()
-
+    
     def _init_coqui(self):
         """Initializes the Coqui XTTS v2 model."""
         try:
@@ -50,7 +51,7 @@ class VoiceCloner:
         except Exception as e:
             logger.error(f"Failed to initialize Coqui XTTS: {e}")
             self.is_initialized = False
-
+    
     def generate_cloned_audio(self, text: str, output_path: str) -> bool:
         """
         Generates WAV audio of the given text with the cloned voice of the reference file.
@@ -58,11 +59,11 @@ class VoiceCloner:
         if not COQUI_AVAILABLE or not self.is_initialized or not self.tts:
             logger.warning("Coqui XTTS v2 is not active/available. Skipping synthesis.")
             return False
-
+        
         if not os.path.exists(self.voice_sample_path):
             logger.error(f"Voice reference sample file missing at: {self.voice_sample_path}. Using native TTS fallback.")
             return False
-
+        
         try:
             logger.info(f"Cloning voice reference '{self.voice_sample_path}' for speech: '{text[:60]}...'")
             self.tts.tts_to_file(
@@ -75,20 +76,31 @@ class VoiceCloner:
         except Exception as e:
             logger.error(f"Error during Coqui XTTS cloned voice generation: {e}")
             return False
-
-    async def speak(self, client, text: str):
+    
+    async def speak(self, client, text: str, send_provider_text: bool = False):
         """
         Speaks the given text in the meeting using the cloned voice or native fallback.
         
         Args:
             client (AgentCallClient): Reference to the active AgentCall session client.
             text (str): The text content to speak.
+            send_provider_text: If True or if voice_clone_provider is "did", 
+                bypass Coqui synthesis and send text directly via tts.speak.
         """
         if client is None:
             logger.error("VoiceCloner.speak called without a valid client; skipping.")
             return
+    
+        # Determine if we should use Coqui synthesis
+        use_coqui = (
+            COQUI_AVAILABLE 
+            and self.is_initialized 
+            and self.voice_clone_provider == "local" 
+            and not send_provider_text
+        )
 
-        if COQUI_AVAILABLE and self.is_initialized:
+        if use_coqui:
+            # Existing Coqui synthesis path (corrected)
             with tempfile.TemporaryDirectory() as tmpdir:
                 wav_path = os.path.join(tmpdir, "cloned.wav")
                 pcm_path = os.path.join(tmpdir, "output.raw")
@@ -142,16 +154,18 @@ class VoiceCloner:
                                 logger.error(f"FFmpeg failed with: {process.stderr.decode()}")
                         except Exception as e:
                             logger.error(f"Exception during FFmpeg conversion: {e}")
-                        
-        # Robust fallback using AgentCall's highly optimized native TTS
-        logger.info(f"Using AgentCall's native TTS to speak: '{text}'")
-        await client.send_command({"type": "voice.state_update", "state": "speaking"})
-        await client.send_command({"type": "tts.speak", "text": text, "voice": "af_heart"})
+        else:
+            # Direct TTS fallback (no Coqui, no ffmpeg)
+            logger.info(f"Using AgentCall's native TTS to speak: '{text}'")
         
-        # Approximate speech duration based on speaking rate
-        words = len(text.split())
-        est_duration = max(2.0, words * 0.45)  # ~133 words per minute
-        await asyncio.sleep(est_duration)
-        
-        # Reset state back to listening
-        await client.send_command({"type": "voice.state_update", "state": "listening"})
+            # Send speaking state update
+            await client.send_command({"type": "voice.state_update", "state": "speaking"})
+            await client.send_command({"type": "tts.speak", "text": text, "voice": "af_heart"})
+            
+            # Approximate speech duration based on speaking rate
+            words = len(text.split())
+            est_duration = max(2.0, words * 0.45)  # ~133 words per minute
+            await asyncio.sleep(est_duration)
+            
+            # Reset state back to listening
+            await client.send_command({"type": "voice.state_update", "state": "listening"})

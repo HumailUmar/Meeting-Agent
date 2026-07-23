@@ -38,9 +38,24 @@ class SQLiteStateStore:
                     voice_path TEXT,
                     call_id TEXT,
                     pika_session_id TEXT,
+                    avatar_provider TEXT,
+                    provider_session_id TEXT,
+                    stream_url TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            conn.commit()
+
+        with self._get_conn() as conn:
+            for column_ddl in (
+                "ALTER TABLE sessions ADD COLUMN avatar_provider TEXT",
+                "ALTER TABLE sessions ADD COLUMN provider_session_id TEXT",
+                "ALTER TABLE sessions ADD COLUMN stream_url TEXT",
+            ):
+                try:
+                    conn.execute(column_ddl)
+                except sqlite3.OperationalError:
+                    pass
             conn.commit()
 
     def save_session(
@@ -52,12 +67,15 @@ class SQLiteStateStore:
         avatar_path: str, 
         voice_path: str,
         call_id: Optional[str] = None,
-        pika_session_id: Optional[str] = None
+        pika_session_id: Optional[str] = None,
+        avatar_provider: Optional[str] = None,
+        provider_session_id: Optional[str] = None,
+        stream_url: Optional[str] = None
     ):
         with self._get_conn() as conn:
             conn.execute("""
-                INSERT INTO sessions (session_id, meeting_url, bot_name, status, avatar_path, voice_path, call_id, pika_session_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO sessions (session_id, meeting_url, bot_name, status, avatar_path, voice_path, call_id, pika_session_id, avatar_provider, provider_session_id, stream_url)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(session_id) DO UPDATE SET
                     meeting_url=excluded.meeting_url,
                     bot_name=excluded.bot_name,
@@ -65,8 +83,11 @@ class SQLiteStateStore:
                     voice_path=excluded.voice_path,
                     status=excluded.status,
                     call_id=COALESCE(excluded.call_id, sessions.call_id),
-                    pika_session_id=COALESCE(excluded.pika_session_id, sessions.pika_session_id)
-            """, (session_id, meeting_url, bot_name, status, avatar_path, voice_path, call_id, pika_session_id))
+                    pika_session_id=COALESCE(excluded.pika_session_id, sessions.pika_session_id),
+                    avatar_provider=COALESCE(excluded.avatar_provider, sessions.avatar_provider),
+                    provider_session_id=COALESCE(excluded.provider_session_id, sessions.provider_session_id),
+                    stream_url=COALESCE(excluded.stream_url, sessions.stream_url)
+            """, (session_id, meeting_url, bot_name, status, avatar_path, voice_path, call_id, pika_session_id, avatar_provider, provider_session_id, stream_url))
             conn.commit()
 
     def get_session(self, session_id: str) -> Optional[dict]:

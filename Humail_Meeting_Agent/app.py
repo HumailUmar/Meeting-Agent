@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import shutil
@@ -7,13 +8,21 @@ from pathlib import Path
 from urllib.parse import urlparse
 from typing import Dict, List, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, BackgroundTasks, UploadFile, File
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from pydantic import BaseModel
 import uvicorn
 
 import config
 from agent.orchestrator import InterviewAgentOrchestrator
 from agent.store import get_state_store
+
+# Request models
+class StartAgentRequest(BaseModel):
+    meeting_url: Optional[str] = None
+    bot_name: Optional[str] = None
+    llm_provider: Optional[str] = None
+    candidate_data: Optional[Dict] = None
+    avatar_provider: Optional[str] = None
 
 # Persistent session store (SQLite by default, Memory for tests).
 state_store = get_state_store()
@@ -39,6 +48,16 @@ class AppState:
     bot_name: Optional[str] = None
 
 state = AppState()
+
+async def run_orchestrator_background(orchestrator: InterviewAgentOrchestrator):
+    """Background task wrapper for orchestrator.start() with error handling."""
+    try:
+        await orchestrator.start()
+    except asyncio.CancelledError:
+        logger.info("Orchestrator background task cancelled.")
+        await orchestrator.shutdown()
+    except Exception as e:
+        logger.error(f"Orchestrator background task failed: {e}")
 
 # WebSocket Connection Manager
 class ConnectionManager:
@@ -73,85 +92,6 @@ class ConnectionManager:
                 # Stale connection cleanup
                 logger.debug(f"Failed to send to WebSocket, skipping: {e}")
 
-manager = ConnectionManager()
-
-# Pydantic request models
-class StartAgentRequest(BaseModel):
-    meeting_url: Optional[str] = None
-    bot_name: Optional[str] = "Humail"
-    llm_provider: Optional[str] = "ollama"  # "ollama" or "gemini"
-    candidate_data: Optional[dict] = None
-
-async def run_orchestrator_background(orchestrator: InterviewAgentOrchestrator):
-    """Asynchronous background wrapper that executes the agent's main loop and hooks WebSockets."""
-    try:
-        state.current_status = "interviewing"
-        session_id = "active"
-        
-        # Intercept process_question to capture and stream tokens to WebSocket
-        async def hooked_process_question(question: str):
-            nonlocal session_id
-            if orchestrator.session:
-                session_id = orchestrator.session.get("call_id", "active")
-                
-            # 1. Broadcast question to WebSockets
-            await manager.broadcast(session_id, {
-                "event": "question_received",
-                "text": question,
-                "speaker": "Interviewer"
-            })
-            
-            # 2. Transition state to 'thinking'
-            await manager.broadcast(session_id, {"event": "state_change", "state": "thinking"})
-            client = orchestrator.session.get("client") if isinstance(orchestrator.session, dict) else None
-            if client is not None:
-                await client.send_command({"type": "voice.state_update", "state": "thinking"})
-            else:
-                logger.warning("Hooked process_question: client unavailable; skipping voice command.")
-            
-            # 3. Generate answer and stream tokens to WebSocket
-            response_text = ""
-            try:
-                async for chunk in orchestrator.brain.generate_answer(question):
-                    response_text += chunk
-                    sys.stdout.write(chunk)
-                    sys.stdout.flush()
-                    # Broadcast real-time token
-                    await manager.broadcast(session_id, {
-                        "event": "brain_stream_token",
-                        "text": chunk
-                    })
-            except Exception as e:
-                logger.error(f"Error during hooked answer generation: {e}")
-                response_text = response_text or "Sorry, I had a small hiccup there."
-            sys.stdout.write("\n")
-            
-            # 4. Finalize brain generation and transition to 'speaking'
-            await manager.broadcast(session_id, {
-                "event": "brain_response_done",
-                "text": response_text
-            })
-            await manager.broadcast(session_id, {"event": "state_change", "state": "speaking"})
-            
-            # 5. Play cloned voice into meeting
-            if response_text.strip() and client is not None:
-                await orchestrator.cloner.speak(client, response_text)
-                
-            # 6. Reset state to 'listening'
-            await manager.broadcast(session_id, {"event": "state_change", "state": "listening"})
-
-        orchestrator._process_question = hooked_process_question
-        
-        # Start the orchestrator
-        await orchestrator.start()
-    except Exception as e:
-        logger.error(f"Error in background orchestrator task: {e}")
-    finally:
-        state.current_status = "idle"
-        state.orchestrator = None
-        state.orchestrator_task = None
-        logger.info("Agent background task completed.")
-
 # HTML Frontend Serve Route
 @app.get("/", response_class=HTMLResponse, summary="Renders the AI Interview Dashboard UI")
 async def serve_dashboard():
@@ -173,14 +113,12 @@ MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(15 * 1024 * 1024)))  # 
 ALLOWED_AVATAR_EXT = {".png", ".jpg", ".jpeg"}
 ALLOWED_VOICE_EXT = {".wav", ".mp3", ".m4a", ".ogg", ".flac"}
 
-
 def _safe_filename(filename: Optional[str]) -> Optional[str]:
     """Return a normalized lower-case extension, or None if the filename is unsafe."""
     if not filename:
         return None
     ext = os.path.splitext(filename)[1].lower()
     return ext
-
 
 @app.post("/upload/avatar", summary="Upload a custom avatar image")
 async def upload_avatar(file: UploadFile = File(...)):
@@ -217,7 +155,6 @@ async def upload_avatar(file: UploadFile = File(...)):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save avatar image: {e}")
-
 
 @app.post("/upload/voice", summary="Upload a reference voice sample for cloning")
 async def upload_voice(file: UploadFile = File(...)):
@@ -271,6 +208,7 @@ async def start_agent(request: StartAgentRequest):
 
     bot_name = (request.bot_name or "Humail").strip() or "Humail"
     llm_provider = request.llm_provider or "ollama"
+    avatar_provider = request.avatar_provider or config.AVATAR_PROVIDER
     if llm_provider not in ("ollama", "gemini"):
         raise HTTPException(status_code=400, detail="llm_provider must be 'ollama' or 'gemini'.")
 
@@ -301,15 +239,16 @@ async def start_agent(request: StartAgentRequest):
     orchestrator = InterviewAgentOrchestrator(
         meeting_url=meet_url,
         bot_name=bot_name,
-        llm_provider=llm_provider
+        llm_provider=llm_provider,
+        avatar_provider=avatar_provider
     )
-    
+
     if custom_persona:
         orchestrator.brain.persona = custom_persona
         orchestrator.brain.clear_history()
 
     state.orchestrator = orchestrator
-    
+
     # Persist the session so /status survives restarts (SaaS claim).
     try:
         state_store.save_session(
@@ -319,6 +258,9 @@ async def start_agent(request: StartAgentRequest):
             status="starting",
             avatar_path=config.AVATAR_IMAGE_PATH,
             voice_path=config.VOICE_SAMPLE_PATH,
+            avatar_provider=avatar_provider,
+            provider_session_id="",  # Will be populated during start()
+            stream_url=""
         )
     except Exception as e:
         logger.warning(f"Could not persist session to store: {e}")
@@ -340,14 +282,14 @@ async def stop_agent():
 
     logger.info("Received request to stop the active AI Agent.")
     state.current_status = "stopped"
-    
+
     # Trigger orchestrator shutdown with a safety timeout so a hung client call
     # cannot block this endpoint forever.
     try:
         await asyncio.wait_for(state.orchestrator.shutdown(), timeout=30.0)
     except asyncio.TimeoutError:
         logger.error("Orchestrator shutdown timed out after 30s; forcing task cancel.")
-    
+
     # Cancel the asyncio task
     if state.orchestrator_task:
         state.orchestrator_task.cancel()
@@ -377,24 +319,84 @@ async def get_status():
         "coqui_xtts_active": bool(state.orchestrator and getattr(state.orchestrator.cloner, "is_initialized", False)) if state.orchestrator else False
     }
 
-@app.websocket("/ws/session/{session_id}")
-async def websocket_endpoint(websocket: WebSocket, session_id: str):
-    """
-    WebSocket endpoint for receiving real-time status updates (question transcripts, 
-    thinking indicators, and answer playback updates) for a given session.
-    """
-    await manager.connect(session_id, websocket)
+@app.get("/avatar-page/{session_id}", response_class=HTMLResponse, summary="Render avatar page for active session")
+async def avatar_page(session_id: str):
+    # Look up session in state store
+    session_data = state_store.get_session(session_id)
+    if not session_data:
+        return HTMLResponse(content="<h1>No active avatar session.</h1>", status_code=404)
+    
+    if session_data.get("status") not in ["active", "running"]:
+        return HTMLResponse(content="<h1>No active avatar session.</h1>", status_code=404)
+    
+    # Render the avatar page with config injected as a script tag
+    config_data = {
+        "session_id": session_id,
+        "provider": session_data.get("avatar_provider", "did"),
+        "stream_url": session_data.get("stream_url", ""),
+        "active": True
+    }
+    
+    # Inject config as a script tag
+    config_script = f"<script>const AVATAR_CONFIG = {json.dumps(config_data)};</script>"
+    
+    # Load the HTML page and inject the config script
+    html_content = Path(__file__).resolve().parent / "frontend" / "avatar-page.html"
+    if not html_content.exists():
+        return HTMLResponse(content="<h1>Avatar page not found</h1>", status_code=404)
+    
+    html_text = html_content.read_text()
+    if "<head>" in html_text:
+        html_text = html_text.replace("</head>", f"<style>body {{ background-color: black; color: white; font-family: Arial, sans-serif; overflow: hidden; height: 100vh; display: flex; flex-direction: column; justify-content: center; align-items: center; }}</style>{config_script}</head>")
+    else:
+        html_text = f"<html><head>{config_script}</head><body>{html_text}</body></html>"
+    
+    return HTMLResponse(content=html_text, status_code=200)
+
+@app.get("/api/avatar-page/status/{session_id}", response_class=JSONResponse, summary="Get avatar page status")
+async def avatar_page_status(session_id: str):
+    # Look up session in state store
+    session_data = state_store.get_session(session_id)
+    if not session_data:
+        return JSONResponse(content={"error": "Session not found"}, status_code=404)
+    
+    if session_data.get("status") not in ["active", "running"]:
+        return JSONResponse(content={"error": "Session not active"}, status_code=404)
+    
+    return JSONResponse(content={
+        "session_id": session_id,
+        "provider": session_data.get("avatar_provider", "did"),
+        "stream_url": session_data.get("stream_url", ""),
+        "active": True
+    })
+
+@app.post("/api/avatar-page/stop", response_class=JSONResponse, summary="Stop avatar session")
+async def avatar_page_stop(session_data: Dict[str, str]):
+    session_id = session_data.get("session_id")
+    if not session_id:
+        return {"status": "error", "message": "session_id required"}
+    
+    if not state.orchestrator:
+        return {"status": "idle", "message": "Agent is not currently running."}
+    
+    logger.info(f"Avatar page stop request received for session: {session_id}")
+    state.current_status = "stopped"
+    
     try:
-        while True:
-            # Keep connection open and respond to any client messages if sent
-            data = await websocket.receive_text()
-            # Simple heartbeat response
-            await websocket.send_json({"event": "heartbeat", "received": data})
-    except WebSocketDisconnect:
-        manager.disconnect(session_id, websocket)
-    except Exception as e:
-        logger.error(f"WebSocket connection error on session {session_id}: {e}")
-        manager.disconnect(session_id, websocket)
+        await asyncio.wait_for(state.orchestrator.shutdown(), timeout=30.0)
+    except asyncio.TimeoutError:
+        logger.error("Orchestrator shutdown timed out after 30s; forcing task cancel.")
+    
+    if state.orchestrator_task:
+        state.orchestrator_task.cancel()
+        try:
+            await state.orchestrator_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        state.orchestrator_task = None
+    
+    state.orchestrator = None
+    return {"status": "stopped", "message": "AI Agent has been successfully stopped."}
 
 if __name__ == "__main__":
     # Start FastApi server on port 8000

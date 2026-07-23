@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Avatar Page</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: black;
+            color: white;
+            font-family: Arial, sans-serif;
+            overflow: hidden;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+        }
+        #avatar-video {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            border-radius: 4px;
+        }
+        #status-overlay {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background-color: rgba(0, 0, 0, 0.7);
+            padding: 5px 10px;
+            border-radius: 4px;
+            font-size: 14px;
+            z-index: 10;
+        }
+        #error-overlay {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background-color: rgba(255, 0, 0, 0.8);
+            color: white;
+            padding: 20px;
+            border-radius: 8px;
+            text-align: center;
+            z-index: 20;
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <video id="avatar-video" autoplay playsinline muted style="width:100%;height:100%;object-fit:cover;"></video>
+    <div id="status-overlay">Loading avatar...</div>
+    <div id="error-overlay"></div>
+
+    <script>
+        // Parse session_id from URL path
+        const url = new URL(window.location);
+        const pathParts = url.pathname.split('/');
+        const session_id = pathParts[pathParts.length - 1];
+
+        // Load config from injected script tag, query param, or global variable
+        let config = {};
+        
+        // Try injected script with data-config attribute
+        const scripts = document.getElementsByTagName('script');
+        for (let i = 0; i < scripts.length; i++) {
+            const dataConfig = scripts[i].getAttribute('data-config');
+            if (dataConfig) {
+                try {
+                    config = JSON.parse(dataConfig);
+                    break;
+                } catch (e) {
+                    console.error('Failed to parse injected config', e);
+                }
+            }
+        }
+        
+        // Also check query param as fallback
+        if (!config.stream_url) {
+            const queryParams = url.searchParams;
+            if (queryParams.has('config')) {
+                try {
+                    config = JSON.parse(queryParams.get('config'));
+                } catch (e) {
+                    console.error('Failed to parse config query param', e);
+                }
+            }
+        }
+        
+        // Finally check global AVATAR_CONFIG if exists
+        if (!config.stream_url && typeof AVATAR_CONFIG !== 'undefined') {
+            config = AVATAR_CONFIG;
+        }
+
+        const stream_url = config.stream_url || '';
+        const provider = config.provider || 'did';
+        const session_id_from_config = config.session_id || session_id;
+
+        const videoElement = document.getElementById('avatar-video');
+        const statusOverlay = document.getElementById('status-overlay');
+        const errorOverlay = document.getElementById('error-overlay');
+
+        // Set video source
+        if (stream_url) {
+            videoElement.src = stream_url;
+            statusOverlay.textContent = 'Loading avatar...';
+        } else {
+            statusOverlay.textContent = 'No stream URL available';
+        }
+
+        // Audio element for TTS
+        const audioElement = document.createElement('audio');
+        audioElement.style.display = 'none';
+        document.body.appendChild(audioElement);
+
+        // Capture stream when video starts playing
+        videoElement.addEventListener('playing', async () => {
+            try {
+                const capturedStream = videoElement.captureStream();
+                const tracks = capturedStream.getTracks();
+                console.log(`Captured stream with ${tracks.length} tracks`);
+                
+                // Validate capture
+                if (tracks.length === 0) {
+                    showError('Avatar stream unavailable. Falling back to audio only.');
+                }
+                
+                // If audio element exists and has a stream, combine streams
+                if (audioElement.srcObject) {
+                    const combinedStream = new MediaStream([
+                        ...capturedStream.getVideoTracks(),
+                        ...audioElement.srcObject.getAudioTracks()
+                    ]);
+                    videoElement.srcObject = combinedStream;
+                }
+            } catch (err) {
+                console.error('Error capturing stream:', err);
+                showError('Avatar stream unavailable. Falling back to audio only.');
+            }
+        });
+
+        // Poll status endpoint every 5 seconds
+        const pollStatus = async () => {
+            try {
+                const response = await fetch(`/api/avatar-page/status/${session_id_from_config}`);
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+                const data = await response.json();
+                if (!data.active) {
+                    statusOverlay.textContent = 'Session ended';
+                    videoElement.pause();
+                    showError('Session ended');
+                }
+            } catch (err) {
+                console.error('Failed to poll status:', err);
+                // Don't show error for polling failures, just log
+            }
+        };
+
+        // Start polling
+        const intervalId = setInterval(pollStatus, 5000);
+
+        // Handle window unload
+        window.onbeforeunload = async () => {
+            try {
+                await fetch('/api/avatar-page/stop', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ session_id: session_id_from_config })
+                });
+            } catch (err) {
+                console.error('Failed to stop session:', err);
+            }
+        };
+        
+        // Cleanup on unload
+        window.addEventListener('unload', () => {
+            if (intervalId) clearInterval(intervalId);
+        });
+
+        // Error handling
+        function showError(message) {
+            errorOverlay.textContent = message;
+            errorOverlay.style.display = 'block';
+            setTimeout(() => {
+                errorOverlay.style.display = 'none';
+            }, 5000);
+        }
+
+        // Check if stream has tracks on metadata load
+        videoElement.addEventListener('loadedmetadata', () => {
+            if (videoElement.videoTracks.length === 0 && (!audioElement.srcObject || audioElement.srcObject.getAudioTracks().length === 0)) {
+                showError('Avatar stream unavailable. Falling back to audio only.');
+            }
+        });
+    </script>
+</body>
+</html>

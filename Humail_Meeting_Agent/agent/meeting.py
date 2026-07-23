@@ -43,7 +43,7 @@ def _is_valid_meet_url(url: str) -> bool:
         return False
 
 
-async def join_meeting(meeting_url: str, bot_name: str, avatar_image: str = None) -> dict:
+async def join_meeting(meeting_url: str, bot_name: str, avatar_image: str = None, webpage_url: str = None) -> dict:
     """
     Joins the meeting as a bot participant using the AgentCall SDK.
     
@@ -51,6 +51,7 @@ async def join_meeting(meeting_url: str, bot_name: str, avatar_image: str = None
         meeting_url (str): The Google Meet or Zoom meeting URL.
         bot_name (str): The display name of the bot.
         avatar_image (str): Optional path to an avatar image.
+        webpage_url (str): Optional public URL for bot's video feed (avatar page).
         
     Returns:
         dict: A dictionary containing the call information (session reference), 
@@ -78,6 +79,9 @@ async def join_meeting(meeting_url: str, bot_name: str, avatar_image: str = None
         "transcription": True,
         "ui_template": "avatar"
     }
+
+    if webpage_url:
+        create_params["webpage_url"] = webpage_url
 
     try:
         # Create the call via AgentCall SDK

@@ -19,6 +19,15 @@ export default function App() {
   const [meetUrl, setMeetUrl] = useState('');
   const [botName, setBotName] = useState('Humail');
   const [llmProvider, setLlmProvider] = useState('gemini');
+  const [avatarProvider, setAvatarProvider] = useState('did');
+  
+  // Auto-load avatar provider if present in localstorage
+  useEffect(() => {
+    const savedProvider = localStorage.getItem("last_avatar_provider");
+    if (savedProvider) {
+      setAvatarProvider(savedProvider);
+    }
+  }, []);
   
   // Custom Profile Persona State
   const [education, setEducation] = useState('Bachelor of Science in Artificial Intelligence & Computer Science');
@@ -145,12 +154,14 @@ export default function App() {
     }
 
     localStorage.setItem("last_meet_url", meetUrl);
+    localStorage.setItem("last_avatar_provider", avatarProvider);
     setAgentStatus('starting');
     
     const payload = {
       meeting_url: meetUrl,
       bot_name: botName,
       llm_provider: llmProvider,
+      avatar_provider: avatarProvider,
       candidate_data: {
         name: botName,
         education,
@@ -307,6 +318,24 @@ export default function App() {
               <span className="text-xs text-slate-400 font-mono bg-slate-950 border border-slate-800 px-2.5 py-1 rounded-md">{runtime}</span>
             </div>
 
+            {/* Avatar Provider Selection */}
+            <div className="flex flex-col space-y-1.5">
+              <label className="text-xs font-extrabold uppercase tracking-wider text-slate-400">Avatar Provider</label>
+              <div className="flex items-center space-x-4 bg-slate-950 border border-slate-800 rounded-xl p-3">
+                <label className="flex items-center space-x-2 cursor-pointer">
+                  <input 
+                    type="radio" 
+                    name="avatarProvider" 
+                    value="did" 
+                    checked={avatarProvider === 'did'}
+                    onChange={() => setAvatarProvider('did')}
+                    className="w-4 h-4 text-indigo-600 bg-slate-900 border-slate-700 focus:ring-indigo-500 focus:ring-2"
+                  />
+                  <span className="text-sm text-slate-300">D-ID (sub-second latency)</span>
+                </label>
+              </div>
+            </div>
+
             {/* Meeting Link input */}
             <div className="flex flex-col space-y-1.5">
               <label className="text-xs font-extrabold uppercase tracking-wider text-slate-400">Meeting Link (Google Meet / Zoom)</label>
@@ -382,7 +411,7 @@ export default function App() {
               )}
             </div>
 
-            {/* Camera Accordion */}
+            {avatarProvider === 'pika' && (
             <div className="border border-slate-800/80 rounded-xl bg-slate-950/30 p-4">
               <button onClick={() => setShowCamera(!showCamera)} className="flex items-center justify-between w-full text-slate-300 hover:text-indigo-400 transition-colors">
                 <span className="text-xs font-extrabold uppercase tracking-wider flex items-center"><Video className="w-4 h-4 mr-2 text-indigo-400"/>Camera &amp; Video Quality</span>
@@ -418,6 +447,7 @@ export default function App() {
                 </div>
               )}
             </div>
+            )}
 
             {/* Persona Accordion */}
             <div className="border border-slate-800/80 rounded-xl bg-slate-950/30 p-4">

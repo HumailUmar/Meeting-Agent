@@ -36,5 +36,11 @@ REDIS_URL = os.getenv("REDIS_URL", "")
 # S3 or Cloud storage asset upload bucket (if empty, defaults to local folder upload)
 S3_UPLOAD_BUCKET = os.getenv("S3_UPLOAD_BUCKET", "")
 
+AVATAR_PROVIDER = os.getenv("AVATAR_PROVIDER", "pika")
+DID_API_KEY = os.getenv("DID_API_KEY", "")
+HEYGEN_API_KEY = os.getenv("HEYGEN_API_KEY", "")
+BACKEND_BASE_URL = os.getenv("BACKEND_BASE_URL", "http://localhost:8000")
+VOICE_CLONE_PROVIDER = os.getenv("VOICE_CLONE_PROVIDER", "local")
+
 # Meeting Link
 MEETING_URL = os.getenv("MEETING_URL", "")
